@@ -7,8 +7,6 @@ After=dtrack-satellite.network
 ContainerName=dtrack-satellite
 Image=localhost/dtrack-satellite:latest
 
-# Internal app network (no internet)
-#Network=demo.network
 # Egress network
 Network=dtrack-satellite-network
 

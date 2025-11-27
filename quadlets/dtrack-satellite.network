@@ -1,6 +1,6 @@
 [Unit]
 Description=Satellite egress network (only for DTrack)
-#After=network-online.target
+After=network-online.target
 
 [Network]
 NetworkName=dtrack-satellite-network
