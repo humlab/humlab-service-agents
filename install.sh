@@ -63,7 +63,7 @@ cp "$SCRIPT_DIR/podman/build-dtrack-satellite.sh" "$DEST_IMAGE_BUILD/build-dtrac
 
 log "Copying quadlet files"
 cp "$SCRIPT_DIR/quadlets/dtrack-satellite.container" "$DEST_QUADLETS/dtrack-satellite.container"
-cp "$SCRIPT_DIR/quadlets/satellite-network.network" "$DEST_QUADLETS/satellite-network.network"
+cp "$SCRIPT_DIR/quadlets/dtrack-satellite.network" "$DEST_QUADLETS/dtrack-satellite.network"
 
 log "Copying dtrack.env template"
 cp "$TEMPLATE_ENV" "$DEST_ENV_FILE"
@@ -129,7 +129,7 @@ link_quadlet() {
 }
 
 link_quadlet "dtrack-satellite.container"
-link_quadlet "satellite-network.network"
+link_quadlet "dtrack-satellite.network"
 
 # --- Build the container image ---
 log "Building dtrack-satellite container image"
