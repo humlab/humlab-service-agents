@@ -59,6 +59,7 @@ mkdir -p "$DEST_IMAGE_BUILD" "$DEST_QUADLETS" "$DEST_SECRETS" "$QUADLET_SYSTEMD_
 log "Copying Containerfile and satellite.py"
 cp "$SCRIPT_DIR/podman/Containerfile" "$DEST_IMAGE_BUILD/Containerfile"
 cp "$SCRIPT_DIR/podman/satellite.py" "$DEST_IMAGE_BUILD/satellite.py"
+cp "$SCRIPT_DIR/podman/build-dtrack-satellite.sh" "$DEST_IMAGE_BUILD/build-dtrack-satellite.sh"
 
 log "Copying quadlet files"
 cp "$SCRIPT_DIR/quadlets/dtrack-satellite.container" "$DEST_QUADLETS/dtrack-satellite.container"
@@ -66,6 +67,15 @@ cp "$SCRIPT_DIR/quadlets/satellite-network.network" "$DEST_QUADLETS/satellite-ne
 
 log "Copying dtrack.env template"
 cp "$TEMPLATE_ENV" "$DEST_ENV_FILE"
+
+# --- Build the container image ---
+log "Building dtrack-satellite container image"
+if cd "$DEST_IMAGE_BUILD" && bash build-dtrack-satellite.sh; then
+    log "Container image built successfully"
+else
+    log "ERROR: Failed to build container image"
+    exit 1
+fi
 
 # --- Default Values ---
 DT_URL_DEFAULT=$(grep -E '^DT_URL=' "$DEST_ENV_FILE" | cut -d= -f2- || true)
