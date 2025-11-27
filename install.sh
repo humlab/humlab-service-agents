@@ -33,10 +33,10 @@ prompt_required_secret() {
     local prompt="$1"
     local value=""
     while [ -z "$value" ]; do
-        read -r -s -p "$prompt (required): " value || true
-        echo
+        echo -n "$prompt (required): " >&2
+        read -r value || true
         if [ -z "$value" ]; then
-            echo "Value is required, please try again."
+            echo "Value is required, please try again." >&2
         fi
     done
     echo "$value"
