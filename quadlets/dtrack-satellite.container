@@ -1,15 +1,15 @@
 [Unit]
 Description=Dependency-Track Satellite Scanner
-After=demo-service.service
+#After=demo-service.service
 
 [Container]
 ContainerName=dtrack-satellite
 Image=localhost/dtrack-satellite:latest
 
 # Internal app network (no internet)
-Network=demo.network
+#Network=demo.network
 # Egress network
-Network=satellite-network
+Network=dtrack-satellite-network
 
 EnvironmentFile=%h/configuration/secrets/dtrack.env
 
