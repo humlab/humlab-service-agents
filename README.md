@@ -1,5 +1,11 @@
 # Dependency-Track Satellite Scanner
 
+## Installation
+1. Git clone this repository into your `<service home directory>`.
+2. Run `install.sh`.
+
+## Overview
+
 This system provides **automatic SBOM scanning** for each service.
 A lightweight “satellite” container runs inside the service’s Podman/Quadlet stack and periodically:
 
@@ -17,4 +23,3 @@ The satellite is configured with a small `dtrack.env` file that tells it:
 A Quadlet unit starts the satellite, places it on the service’s network, and keeps it running.
 
 In short: **every service automatically reports its real dependencies to Dependency-Track**, with no manual work and no privileged host access.
-
