@@ -140,6 +140,15 @@ else
     exit 1
 fi
 
+# --- Enable Podman socket ---
+log "Enabling Podman socket"
+if systemctl --user enable --now podman.socket; then
+    log "Podman socket enabled and started"
+else
+    log "ERROR: Failed to enable/start Podman socket"
+    exit 1
+fi
+
 # --- Systemd Reload ---
 echo
 log "Reloading systemd user units"
