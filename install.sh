@@ -120,6 +120,15 @@ EOF
 
 chmod 600 "$DEST_ENV_FILE" || true
 
+# --- Build the container image ---
+log "Building dtrack-satellite container image"
+if cd "$DEST_IMAGE_BUILD" && bash build-dtrack-satellite.sh; then
+    log "Container image built successfully"
+else
+    log "ERROR: Failed to build container image"
+    exit 1
+fi
+
 # --- Symlinking Quadlets ---
 log "Setting up quadlet symlinks in $QUADLET_SYSTEMD_DIR"
 
