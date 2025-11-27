@@ -68,15 +68,6 @@ cp "$SCRIPT_DIR/quadlets/satellite-network.network" "$DEST_QUADLETS/satellite-ne
 log "Copying dtrack.env template"
 cp "$TEMPLATE_ENV" "$DEST_ENV_FILE"
 
-# --- Build the container image ---
-log "Building dtrack-satellite container image"
-if cd "$DEST_IMAGE_BUILD" && bash build-dtrack-satellite.sh; then
-    log "Container image built successfully"
-else
-    log "ERROR: Failed to build container image"
-    exit 1
-fi
-
 # --- Default Values ---
 DT_URL_DEFAULT=$(grep -E '^DT_URL=' "$DEST_ENV_FILE" | cut -d= -f2- || true)
 DT_URL_DEFAULT=${DT_URL_DEFAULT:-"https://api.dtrack.humlab.umu.se"}
@@ -120,15 +111,6 @@ EOF
 
 chmod 600 "$DEST_ENV_FILE" || true
 
-# --- Build the container image ---
-log "Building dtrack-satellite container image"
-if cd "$DEST_IMAGE_BUILD" && bash build-dtrack-satellite.sh; then
-    log "Container image built successfully"
-else
-    log "ERROR: Failed to build container image"
-    exit 1
-fi
-
 # --- Symlinking Quadlets ---
 log "Setting up quadlet symlinks in $QUADLET_SYSTEMD_DIR"
 
@@ -148,6 +130,15 @@ link_quadlet() {
 
 link_quadlet "dtrack-satellite.container"
 link_quadlet "satellite-network.network"
+
+# --- Build the container image ---
+log "Building dtrack-satellite container image"
+if cd "$DEST_IMAGE_BUILD" && bash build-dtrack-satellite.sh; then
+    log "Container image built successfully"
+else
+    log "ERROR: Failed to build container image"
+    exit 1
+fi
 
 # --- Systemd Reload ---
 echo
