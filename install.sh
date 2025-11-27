@@ -154,6 +154,13 @@ echo
 log "Reloading systemd user units"
 
 if systemctl --user daemon-reload; then
+    log "Starting dtrack-satellite-network.service"
+    if systemctl --user start dtrack-satellite-network.service; then
+        log "dtrack-satellite-network.service started successfully"
+    else
+        log "WARNING: Could not start dtrack-satellite-network.service"
+    fi
+
     log "Enabling and starting dtrack-satellite.service"
 
     if systemctl --user enable --now dtrack-satellite.service; then
