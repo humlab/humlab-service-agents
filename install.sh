@@ -161,12 +161,12 @@ if systemctl --user daemon-reload; then
         log "WARNING: Could not start dtrack-satellite-network.service"
     fi
 
-    log "Enabling and starting dtrack-satellite.service"
+    log "Starting dtrack-satellite.service"
 
-    if systemctl --user enable --now dtrack-satellite.service; then
-        log "dtrack-satellite.service enabled and started"
+    if systemctl --user start --now dtrack-satellite.service; then
+        log "dtrack-satellite.service started"
     else
-        log "WARNING: Could not enable/start service"
+        log "WARNING: Could not start dtrack-satellite.service"
     fi
 else
     log "WARNING: systemctl --user daemon-reload failed"
