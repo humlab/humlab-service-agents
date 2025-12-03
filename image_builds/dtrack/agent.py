@@ -297,7 +297,7 @@ def wait_for_bom(token: str) -> None:
 
 def main_loop():
     hostname = socket.gethostname()
-    log(f"Satellite starting, DT root project={DT_PROJECT_NAME}, host={hostname}")
+    log(f"Agent starting, DT root project={DT_PROJECT_NAME}, host={hostname}")
 
     parent_uuid = get_or_create_project(DT_PROJECT_NAME, hostname, parent_uuid=None)
     if not parent_uuid:

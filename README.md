@@ -1,25 +1,50 @@
-# Dependency-Track Satellite Scanner
+# Humlab Service Agents
+
+Lightweight satellite agents for automated security scanning and log collection in Podman environments.
+
+## Agents
+
+### Dependency-Track Agent
+Automatically scans container images with Syft and uploads SBOMs to Dependency-Track for vulnerability tracking.
+
+### OpenSearch Agent
+Streams container logs to OpenSearch (or stdout in local mode) for centralized log management.
 
 ## Installation
-1. Git clone this repository into your `<service home directory>`.
-2. Run `install.sh`.
 
-## Overview
+```bash
+./install.sh
+```
 
-This system provides **automatic SBOM scanning** for each service.
-A lightweight “satellite” container runs inside the service’s Podman/Quadlet stack and periodically:
+The installer will:
+- Prompt for configuration (API keys, URLs, etc.)
+- Build agent containers
+- Set up systemd services
+- Start the agents
 
-1. **Generates SBOMs** for the service’s container images using *Syft*.
-2. **Uploads them** to Dependency-Track via its API.
+Configuration is stored in `~/configuration/secrets/`:
+- `dtrack.env` - Dependency-Track settings
+- `opensearch.env` - OpenSearch settings
 
-Each service runs its own satellite.
-The satellite is configured with a small `dtrack.env` file that tells it:
+## Management
 
-* where the Dependency-Track server is
-* which project/version to upload to
-* which images to scan
-* how often to scan
+```bash
+# View status
+systemctl --user status dtrack-agent.service
+systemctl --user status opensearch-agent.service
 
-A Quadlet unit starts the satellite, places it on the service’s network, and keeps it running.
+# View logs
+journalctl --user -u dtrack-agent.service -f
+journalctl --user -u opensearch-agent.service -f
 
-In short: **every service automatically reports its real dependencies to Dependency-Track**, with no manual work and no privileged host access.
+# Restart after config changes
+systemctl --user restart dtrack-agent.service
+```
+
+## How It Works
+
+Both agents:
+- Discover running containers via Podman socket
+- Run as unprivileged user containers
+- Operate on isolated egress network
+- Require no manual intervention after setup

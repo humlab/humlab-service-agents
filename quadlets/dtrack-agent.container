@@ -1,14 +1,14 @@
 [Unit]
-Description=Dependency-Track Satellite Scanner
-Requires=dtrack-satellite.network
-After=dtrack-satellite.network
+Description=Dependency-Track Scanner
+Requires=egress.network
+After=egress.network
 
 [Container]
-ContainerName=dtrack-satellite
-Image=localhost/dtrack-satellite:latest
+ContainerName=dtrack-agent
+Image=localhost/dtrack-agent:latest
 
 # Egress network
-Network=dtrack-satellite-network
+Network=egress-network
 
 EnvironmentFile=%h/configuration/secrets/dtrack.env
 

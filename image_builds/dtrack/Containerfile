@@ -22,4 +22,4 @@ RUN chmod +x /app/satellite.py
 
 ENV SCAN_INTERVAL_SECONDS=86400
 
-ENTRYPOINT ["python3", "/app/satellite.py"]
+ENTRYPOINT ["python3", "/app/agent.py"]

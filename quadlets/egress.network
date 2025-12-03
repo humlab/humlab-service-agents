@@ -1,9 +1,9 @@
 [Unit]
-Description=Satellite egress network (only for DTrack)
+Description=Egress network for humlab security agents
 After=network-online.target
 
 [Network]
-NetworkName=dtrack-satellite-network
+NetworkName=egress-network
 Driver=bridge
 # give it its own subnet so we can firewall it
 Subnet=10.42.0.0/24
