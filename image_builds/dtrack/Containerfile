@@ -17,8 +17,8 @@ RUN curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
 
 WORKDIR /app
 
-COPY satellite.py /app/satellite.py
-RUN chmod +x /app/satellite.py
+COPY agent.py /app/agent.py
+RUN chmod +x /app/agent.py
 
 ENV SCAN_INTERVAL_SECONDS=86400
 

@@ -79,7 +79,7 @@ def send_log(doc: dict):
     """
     if AGENT_MODE == "local":
         # Local/debug mode: just print JSON lines to stdout so you can inspect with
-        # `podman logs opensearch-satellite`.
+        # `podman logs opensearch-agent`.
         # Trim message a bit to avoid insane spam.
         msg = doc.get("message", "")
         doc_print = dict(doc)
@@ -141,7 +141,7 @@ def stream_logs(container_id: str, name: str):
 # Main discovery loop
 # -----------------------------------------------------------------------------
 def main():
-    logger.info("Starting OpenSearch satellite")
+    logger.info("Starting OpenSearch agent")
     logger.info("Mode: %s", AGENT_MODE)
     logger.info("Podman socket: %s", PODMAN_SOCKET_PATH)
 
