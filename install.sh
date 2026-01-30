@@ -11,6 +11,7 @@ DEST_SECRETS="$DEST_BASE/secrets"
 DEST_ENV_FILE_DTRACK="$DEST_SECRETS/dtrack.env"
 DEST_ENV_FILE_OPENSEARCH="$DEST_SECRETS/opensearch.env"
 DEST_ENV_FILE_CADVISOR="$DEST_SECRETS/cadvisor.env"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Quadlet systemd directory
 QUADLET_SYSTEMD_DIR="$HOME/.config/containers/systemd"
@@ -19,6 +20,10 @@ QUADLET_SYSTEMD_DIR="$HOME/.config/containers/systemd"
 log() {
     echo "[install] $*" >&2
 }
+
+fail() { log "ERROR: $*"; exit 1; }
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 prompt_with_default() {
     local prompt="$1"
@@ -46,28 +51,98 @@ prompt_required_secret() {
     echo "$value"
 }
 
-# --- Locate source tree ---
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+detect_podman_sock() {
+  local candidates=(
+    "${XDG_RUNTIME_DIR:-/run/user/$UID}/podman/podman.sock"
+    "/run/user/$UID/podman/podman.sock"
+    "/run/podman/podman.sock"
+  )
+  local s
+  for s in "${candidates[@]}"; do
+    [ -S "$s" ] && echo "$s" && return 0
+  done
+  return 1
+}
 
+check_readable_file() {
+  local f="$1"
+  [ -f "$f" ] || fail "Required file not found: $f"
+  [ -r "$f" ] || fail "Required file not readable: $f"
+}
+
+check_writable_dir() {
+  local d="$1"
+  mkdir -p "$d" 2>/dev/null || fail "Cannot create directory: $d"
+  [ -w "$d" ] || fail "Directory not writable: $d"
+}
+
+# --- Preflight checks ---
+log "Running preflight checks"
+
+# Basic environment
+[ -n "${HOME:-}" ] || fail "\$HOME is not set"
+check_writable_dir "$HOME"
+
+# Required commands
+for c in bash cp ln rm mkdir grep cut tr basename dirname sed hostname; do
+  have_cmd "$c" || fail "Missing required command: $c"
+done
+
+have_cmd podman    || fail "podman is not installed or not in PATH"
+have_cmd systemctl || fail "systemctl is not installed or not in PATH"
+
+# Python requirement (host)
+have_cmd python3 || fail "python3 is required but not installed"
+python3 -c 'import sys; assert sys.version_info >= (3,8), sys.version' \
+  || fail "python3 >= 3.8 is required"
+
+# Podman usability (rootless)
+podman info >/dev/null 2>&1 || fail "podman is installed but not usable for this user (podman info failed)"
+
+# systemd user session availability
+if ! systemctl --user status >/dev/null 2>&1; then
+  fail "systemd user instance not available (systemctl --user failed).
+You may need an active user session or to enable lingering: sudo loginctl enable-linger $USER"
+fi
+
+# Quadlet directory expectation (rootless quadlets)
+check_writable_dir "$QUADLET_SYSTEMD_DIR"
+
+# Locate source tree (requires SCRIPT_DIR already set)
+check_readable_file "$SCRIPT_DIR/env/dtrack.env"
+check_readable_file "$SCRIPT_DIR/env/opensearch.env"
+check_readable_file "$SCRIPT_DIR/env/cadvisor.env"
+
+check_readable_file "$SCRIPT_DIR/image_builds/dtrack/Containerfile"
+check_readable_file "$SCRIPT_DIR/image_builds/dtrack/agent.py"
+check_readable_file "$SCRIPT_DIR/image_builds/dtrack/build-dtrack-agent.sh"
+
+check_readable_file "$SCRIPT_DIR/image_builds/opensearch/Containerfile"
+check_readable_file "$SCRIPT_DIR/image_builds/opensearch/agent.py"
+
+check_readable_file "$SCRIPT_DIR/image_builds/cadvisor/Containerfile"
+
+check_readable_file "$SCRIPT_DIR/quadlets/dtrack-agent.container"
+check_readable_file "$SCRIPT_DIR/quadlets/opensearch-agent.container"
+check_readable_file "$SCRIPT_DIR/quadlets/cadvisor-agent.container"
+check_readable_file "$SCRIPT_DIR/quadlets/egress.network"
+
+log "Preflight checks passed"
+
+# --- Source templates ---
 TEMPLATE_ENV_DTRACK="$SCRIPT_DIR/env/dtrack.env"
 TEMPLATE_ENV_OPENSEARCH="$SCRIPT_DIR/env/opensearch.env"
 TEMPLATE_ENV_CADVISOR="$SCRIPT_DIR/env/cadvisor.env"
-if [ ! -f "$TEMPLATE_ENV_DTRACK" ]; then
-    log "ERROR: dtrack.env template not found."
-    exit 1
-fi
-if [ ! -f "$TEMPLATE_ENV_OPENSEARCH" ]; then
-    log "ERROR: opensearch.env template not found."
-    exit 1
-fi
-if [ ! -f "$TEMPLATE_ENV_CADVISOR" ]; then
-    log "ERROR: cadvisor.env template not found."
-    exit 1
-fi
 
 # --- Prepare destination directories ---
 log "Creating destination directories under $DEST_BASE"
-mkdir -p "$DEST_IMAGE_BUILD_DTRACK" "$DEST_IMAGE_BUILD_OPENSEARCH" "$DEST_IMAGE_BUILD_CADVISOR" "$DEST_QUADLETS" "$DEST_SECRETS" "$QUADLET_SYSTEMD_DIR"
+mkdir -p \
+  "$DEST_IMAGE_BUILD_DTRACK" \
+  "$DEST_IMAGE_BUILD_OPENSEARCH" \
+  "$DEST_IMAGE_BUILD_CADVISOR" \
+  "$DEST_QUADLETS" \
+  "$DEST_SECRETS" \
+  "$QUADLET_SYSTEMD_DIR"
 
 # --- Copy dtrack files ---
 log "Copying dtrack-agent files"
@@ -157,6 +232,11 @@ OPENSEARCH_URL="$(prompt_with_default "OPENSEARCH_URL" "$OPENSEARCH_URL_DEFAULT"
 AGENT_MODE="$(prompt_with_default "AGENT_MODE (opensearch/local)" "$AGENT_MODE_DEFAULT")"
 NODE_NAME="$(prompt_with_default "NODE_NAME" "$NODE_NAME_DEFAULT")"
 
+case "$AGENT_MODE" in
+  local|opensearch) ;;
+  *) fail "AGENT_MODE must be 'local' or 'opensearch' (got: $AGENT_MODE)" ;;
+esac
+
 echo
 echo "Writing opensearch configuration to: $DEST_ENV_FILE_OPENSEARCH"
 cat >"$DEST_ENV_FILE_OPENSEARCH" <<EOF
@@ -198,67 +278,56 @@ log "Building dtrack-agent container image"
 if cd "$DEST_IMAGE_BUILD_DTRACK" && bash build-dtrack-agent.sh; then
     log "dtrack-agent image built successfully"
 else
-    log "ERROR: Failed to build dtrack-agent image"
-    exit 1
+    fail "Failed to build dtrack-agent image"
 fi
 
 log "Building opensearch-agent container image"
 if cd "$DEST_IMAGE_BUILD_OPENSEARCH" && podman build --no-cache -t localhost/opensearch-agent:latest .; then
     log "opensearch-agent image built successfully"
 else
-    log "ERROR: Failed to build opensearch-agent image"
-    exit 1
+    fail "Failed to build opensearch-agent image"
 fi
 
 log "Building cadvisor-agent container image"
 if cd "$DEST_IMAGE_BUILD_CADVISOR" && podman build --no-cache -t localhost/cadvisor-agent:latest .; then
     log "cadvisor-agent image built successfully"
 else
-    log "ERROR: Failed to build cadvisor-agent image"
-    exit 1
+    fail "Failed to build cadvisor-agent image"
 fi
 
 # --- Enable Podman socket ---
 log "Enabling Podman socket"
-if systemctl --user enable --now podman.socket; then
-    log "Podman socket enabled and started"
-else
-    log "ERROR: Failed to enable/start Podman socket"
-    exit 1
-fi
+systemctl --user enable --now podman.socket || fail "Failed to enable/start podman.socket"
+systemctl --user is-active --quiet podman.socket || fail "podman.socket is not active after enabling"
+
+PODMAN_SOCK="$(detect_podman_sock)" || fail "Could not find Podman socket after enabling podman.socket"
+
+# Update opensearch env file safely
+sed -i "s|^PODMAN_SOCKET_PATH=.*$|PODMAN_SOCKET_PATH=$PODMAN_SOCK|" "$DEST_ENV_FILE_OPENSEARCH"
 
 # --- Systemd Reload ---
 echo
 log "Reloading systemd user units"
 
 if systemctl --user daemon-reload; then
+    log "Validating quadlet unit generation"
+    for unit in egress-network.service dtrack-agent.service opensearch-agent.service cadvisor-agent.service; do
+        # list-unit-files is less sensitive to inactive/failed units than status
+        systemctl --user list-unit-files "$unit" >/dev/null 2>&1 \
+            || fail "Quadlet did not generate expected unit: $unit"
+    done
+
     log "Starting egress-network.service"
-    if systemctl --user start egress-network.service; then
-        log "egress-network.service started successfully"
-    else
-        log "WARNING: Could not start egress-network.service"
-    fi
+    systemctl --user start egress-network.service || log "WARNING: Could not start egress-network.service"
 
     log "Starting dtrack-agent.service"
-    if systemctl --user start --now dtrack-agent.service; then
-        log "dtrack-agent.service started"
-    else
-        log "WARNING: Could not start dtrack-agent.service"
-    fi
+    systemctl --user start --now dtrack-agent.service || log "WARNING: Could not start dtrack-agent.service"
 
     log "Starting opensearch-agent.service"
-    if systemctl --user start --now opensearch-agent.service; then
-        log "opensearch-agent.service started"
-    else
-        log "WARNING: Could not start opensearch-agent.service"
-    fi
+    systemctl --user start --now opensearch-agent.service || log "WARNING: Could not start opensearch-agent.service"
 
     log "Starting cadvisor-agent.service"
-    if systemctl --user start --now cadvisor-agent.service; then
-        log "cadvisor-agent.service started"
-    else
-        log "WARNING: Could not start cadvisor-agent.service"
-    fi
+    systemctl --user start --now cadvisor-agent.service || log "WARNING: Could not start cadvisor-agent.service"
 else
     log "WARNING: systemctl --user daemon-reload failed"
 fi
