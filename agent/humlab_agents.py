@@ -365,6 +365,17 @@ def split_image_ref(ref: str) -> tuple:
     return ref, "latest"
 
 
+def sbom_project_name(c: dict) -> str:
+    """The container's project name under its service in Dependency-Track: its
+    own name when a systemd unit or compose file keeps that name stable, else
+    its image's. Containers created on demand (e.g. one per user session) get
+    new names all the time and would leave a project behind each."""
+    labels = c["labels"]
+    if labels.get(SYSTEMD_UNIT_LABEL) or labels.get("com.docker.compose.project"):
+        return c["name"]
+    return "image-" + split_image_ref(c["image"])[0].rsplit("/", 1)[-1]
+
+
 def scan_image(svc: Service, container: dict) -> dict:
     """Save the container's image to a tar and run syft on it, both unprivileged
     where possible: a rootless Podman image is saved and scanned as its owner;
@@ -441,6 +452,7 @@ def cmd_sbom(args) -> int:
             log(f"{svc.name}: no running containers, skipped")
             continue
         # Project tree: <service> @ <host>  ->  <service>/<container> @ <host>
+        # (<service>/image-<name> for containers without a stable name)
         try:
             dt.upload(svc.name, host, EMPTY_BOM, [host, svc.name])
         except (RuntimeError, OSError) as e:
@@ -448,15 +460,20 @@ def cmd_sbom(args) -> int:
             failures += 1
             continue
         boms = {}
+        uploaded = set()
         for c in svc.containers:
             image_key = c["image_id"] or c["image"]
+            child = sbom_project_name(c)
+            if child in uploaded:
+                continue
             try:
                 if image_key not in boms:
                     log(f"{svc.name}: scanning {c['image']}")
                     boms[image_key] = scan_image(svc, c)
-                dt.upload(f"{svc.name}/{c['name']}", host, boms[image_key], [host, svc.name],
+                dt.upload(f"{svc.name}/{child}", host, boms[image_key], [host, svc.name],
                           parent=(svc.name, host))
-                log(f"{svc.name}: uploaded SBOM for {c['name']} ({len(boms[image_key].get('components', []))} components)")
+                uploaded.add(child)
+                log(f"{svc.name}: uploaded SBOM for {child} ({len(boms[image_key].get('components', []))} components)")
             except subprocess.CalledProcessError as e:
                 log(f"ERROR: {svc.name}/{c['name']}: {' '.join(e.cmd[:3])} failed: {(e.stderr or '').strip()[:300]}")
                 failures += 1

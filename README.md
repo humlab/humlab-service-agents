@@ -146,7 +146,9 @@ node_exporter's, so stock node_exporter dashboards need their queries adapted.
 
 In Dependency-Track, each service is a project `<service>` with version
 `<host>`, and each container a child project `<service>/<container>` with the
-same version.
+same version. Containers that no systemd unit or compose file started (their
+names change, e.g. one per user session) are grouped by image instead:
+`<service>/image-<image name>`.
 
 ## Operating it
 
