@@ -100,6 +100,21 @@ path = /data/sead_query_api
 - **Quadlet**: every user whose home is `/srv/<name>` and who has
   `~/.config/containers/systemd/`. All containers in that user's Podman belong
   to the service.
+- **Systemd-started Podman projects** in any other account, for example a
+  deployment that installs its quadlets into `~/.config/containers/systemd/`
+  of a personal user. These are found through the running containers: quadlet
+  labels each one with its systemd unit (`PODMAN_SYSTEMD_UNIT`). The unit's
+  quadlet file leads to the project directory:
+  - A symlinked quadlet belongs to the project the link points into.
+  - A copied or generated quadlet belongs to the project its `EnvironmentFile=`
+    and `Volume=` paths point into.
+
+  The project directory is the nearest directory with `.git`, `.env` or a
+  compose file. Repositories checked out inside it count as part of it. The
+  service is registered with `deployment = quadlet` and that directory as
+  `path`, and is named after the directory by default. Containers that no
+  unit started, such as ones a service creates through the Podman API, belong
+  to the user's service if the user has only one.
 - **Compose**: a directory with a compose file. The installer searches `/srv`,
   `/home`, `/data`, `/data-spinn` and `/opt` (four levels deep, and you can
   change the list), and you can add other directories by hand. Containers belong

@@ -14,6 +14,7 @@ the user who owns it, and runs syft unprivileged. Standard library only.
 import argparse
 import base64
 import configparser
+import glob
 import json
 import os
 import pwd
@@ -24,6 +25,7 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,6 +41,12 @@ DEFAULT_ROOTS = ("/srv", "/home", "/data", "/data-spinn", "/opt")
 SKIP_DIRS = {".git", ".cache", ".local", ".config", "node_modules", "venv", ".venv",
              "__pycache__", "site-packages", "overlay", "overlay-containers", "volumes"}
 SEARCH_DEPTH = 4
+
+# Containers started by a systemd unit (quadlet, or podman generate systemd)
+# carry this label. The unit's source file leads to the project directory.
+SYSTEMD_UNIT_LABEL = "PODMAN_SYSTEMD_UNIT"
+PROJECT_MARKERS = (".git", ".env") + COMPOSE_FILES
+SYSTEM_PATHS = ("/etc/", "/run/", "/var/run/", "/proc/", "/sys/", "/dev/", "/tmp/", "/usr/")
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -56,7 +64,8 @@ class Service:
     deployment: str            # quadlet | compose
     runtime: str               # podman | docker
     owner: str                 # user whose runtime holds the containers (root for docker)
-    path: str                  # quadlet: the user's home; compose: the project directory
+    path: str                  # quadlet: the user's home, or the project directory its
+                               # units come from; compose: the project directory
     project: str = ""          # compose project name, when it differs from the directory name
     containers: list = field(default_factory=list)
 
@@ -79,6 +88,11 @@ def compose_project_name(path: str) -> str:
 
 def same_path(a: str, b: str) -> bool:
     return os.path.realpath(a) == os.path.realpath(b)
+
+
+def is_under(path: str, parent: str) -> bool:
+    path, parent = os.path.realpath(path), os.path.realpath(parent)
+    return path == parent or path.startswith(parent.rstrip("/") + "/")
 
 
 def load_registry() -> list:
@@ -154,7 +168,11 @@ def attach_containers(services: list) -> None:
     """Fill each service's .containers from its runtime.
 
     Compose services claim containers by their compose labels. A quadlet
-    service owns every other container in its user's Podman.
+    service claims the containers whose systemd unit comes from its directory
+    (the most specific one wins). A quadlet service for a whole user (path is
+    the user's home) also owns every other container in that user's Podman;
+    otherwise a user's only quadlet service owns the containers that no unit
+    started, such as containers its own services start through the Podman API.
     """
     groups = {}
     for s in services:
@@ -169,12 +187,108 @@ def attach_containers(services: list) -> None:
             continue
         compose = [s for s in group if s.deployment == "compose"]
         quadlet = [s for s in group if s.deployment == "quadlet"]
+        projects = systemd_projects(owner, containers) if runtime == "podman" and quadlet else {}
+        home = pwd.getpwnam(owner).pw_dir if quadlet else ""
+        whole_user = next((s for s in quadlet if same_path(s.path, home)), None)
         for c in containers:
             owner_svc = next((s for s in compose if s.matches(c["labels"])), None)
-            if owner_svc is None and quadlet:
+            project = projects.get(c["id"], "")
+            if owner_svc is None and project:
+                owner_svc = max((s for s in quadlet if is_under(project, s.path)),
+                                key=lambda s: len(os.path.realpath(s.path)), default=None)
+            if owner_svc is None and whole_user:
+                owner_svc = whole_user
+            if owner_svc is None and not project and len(quadlet) == 1:
                 owner_svc = quadlet[0]
             if owner_svc:
                 owner_svc.containers.append(c)
+
+
+# ---------------------------------------------------------------- systemd units
+
+def unit_sources(owner: str, units: list) -> dict:
+    """unit -> the file it was generated from (a quadlet), or else its unit file."""
+    if not units:
+        return {}
+    argv = ["systemctl", *([] if owner == "root" else ["--user"]), "show",
+            "-p", "Id", "-p", "SourcePath", "-p", "FragmentPath", "--", *units]
+    sources = {}
+    for block in run_as(owner, argv).stdout.split("\n\n"):
+        props = dict(line.split("=", 1) for line in block.splitlines() if "=" in line)
+        if props.get("Id"):
+            sources[props["Id"]] = props.get("SourcePath") or props.get("FragmentPath") or ""
+    return sources
+
+
+def in_unit_dir(path: str) -> bool:
+    """True for files in the directories systemd and quadlet read units from."""
+    return (path.startswith(("/etc/", "/usr/", "/run/"))
+            or "/.config/containers/systemd/" in path or "/.config/systemd/user/" in path)
+
+
+def host_paths(unit_file: str, owner: str) -> list:
+    """Host paths a quadlet loads or mounts (EnvironmentFile=, Volume=, Mount=), drop-ins included."""
+    pw = pwd.getpwnam(owner)
+    paths = []
+    for f in [unit_file] + sorted(glob.glob(glob.escape(unit_file) + ".d/*.conf")):
+        try:
+            lines = Path(f).read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            key, _, value = line.strip().partition("=")
+            if key == "EnvironmentFile":
+                found = [value.lstrip("-")]
+            elif key == "Volume":
+                found = [value.split(":", 1)[0]]
+            elif key == "Mount":
+                found = [kv.split("=", 1)[1] for kv in value.split(",") if kv.startswith(("source=", "src="))]
+            else:
+                continue
+            for p in found:
+                p = p.strip().replace("%h", pw.pw_dir).replace("%U", str(pw.pw_uid))
+                if p.startswith("/") and "%" not in p and not p.startswith(SYSTEM_PATHS):
+                    paths.append(os.path.normpath(p))
+    return paths
+
+
+def project_root(path: str) -> str:
+    """Nearest directory at or above path that holds .git, .env or a compose file."""
+    d = os.path.realpath(path if os.path.isdir(path) else os.path.dirname(path))
+    while d != "/":
+        if any(os.path.exists(os.path.join(d, m)) for m in PROJECT_MARKERS):
+            return d
+        d = os.path.dirname(d)
+    return ""
+
+
+def unit_project(source: str, owner: str) -> str:
+    """The project directory a unit comes from, or '' when it cannot be told.
+
+    A unit file that lives in a project (usually a quadlet symlinked into
+    ~/.config/containers/systemd) belongs to that project. A copied or
+    generated quadlet belongs to the project most of its env files and
+    mounts point into.
+    """
+    if not source:
+        return ""
+    real = os.path.realpath(source)
+    if not in_unit_dir(real):
+        return project_root(real) or os.path.dirname(real)
+    votes = Counter(r for r in map(project_root, host_paths(real, owner)) if r)
+    return votes.most_common(1)[0][0] if votes else ""
+
+
+def systemd_projects(owner: str, containers: list) -> dict:
+    """container id -> project directory, for containers a systemd unit started."""
+    units = sorted({c["labels"].get(SYSTEMD_UNIT_LABEL) for c in containers} - {None, ""})
+    try:
+        sources = unit_sources(owner, units)
+    except (RuntimeError, KeyError, subprocess.SubprocessError, OSError) as e:
+        log(f"WARNING: cannot read systemd units for {owner}: {str(getattr(e, 'stderr', '') or e).strip()}")
+        return {}
+    projects = {u: unit_project(sources.get(u, ""), owner) for u in units}
+    return {c["id"]: projects.get(c["labels"].get(SYSTEMD_UNIT_LABEL), "") for c in containers}
 
 
 # ---------------------------------------------------------------- inventory
@@ -376,9 +490,8 @@ def find_compose_dirs(roots: list) -> list:
     return sorted(set(found))
 
 
-def running_compose_projects() -> dict:
-    """realpath(working dir) -> (runtime, owner, project) for running compose containers,
-    across Docker, rootful Podman and every user Podman with a runtime dir."""
+def container_runtimes() -> list:
+    """(runtime, owner) for Docker, rootful Podman and every user Podman with a runtime dir."""
     sources = []
     if shutil.which("docker") and os.path.exists("/var/run/docker.sock"):
         sources.append(("docker", "root"))
@@ -389,8 +502,13 @@ def running_compose_projects() -> dict:
                 sources.append(("podman", pwd.getpwuid(int(entry)).pw_name))
             except (ValueError, KeyError):
                 pass
+    return sources
+
+
+def running_compose_projects() -> dict:
+    """realpath(working dir) -> (runtime, owner, project) for running compose containers."""
     projects = {}
-    for runtime, owner in sources:
+    for runtime, owner in container_runtimes():
         try:
             containers = list_containers(runtime, owner)
         except (RuntimeError, subprocess.SubprocessError, OSError, ValueError):
@@ -400,6 +518,36 @@ def running_compose_projects() -> dict:
             if wd:
                 projects.setdefault(os.path.realpath(wd), (runtime, owner, c["labels"].get("com.docker.compose.project", "")))
     return projects
+
+
+def running_systemd_projects() -> list:
+    """(owner, project directory, units) for running Podman containers that systemd
+    units started, in any account. A project nested in another (a repository
+    checked out inside a deployment) counts as the outer one. Units whose project
+    cannot be told go to the owner's only project, or else count as the owner's home."""
+    found = []
+    for runtime, owner in container_runtimes():
+        if runtime != "podman":
+            continue
+        try:
+            containers = [c for c in list_containers(runtime, owner) if c["labels"].get(SYSTEMD_UNIT_LABEL)]
+        except (RuntimeError, subprocess.SubprocessError, OSError, ValueError):
+            continue
+        projects = systemd_projects(owner, containers)
+        known = {p for p in projects.values() if p}
+        outer = {p: min((q for q in known if is_under(p, q)), key=len) for p in known}
+        tops = set(outer.values())
+        fallback = next(iter(tops)) if len(tops) == 1 else pwd.getpwnam(owner).pw_dir
+        groups = {}
+        for c in containers:
+            project = outer.get(projects.get(c["id"], ""), fallback)
+            groups.setdefault(project, set()).add(c["labels"][SYSTEMD_UNIT_LABEL].removesuffix(".service"))
+        found += [(owner, project, sorted(units)) for project, units in sorted(groups.items())]
+    return found
+
+
+def default_name(path: str, fallback: str) -> str:
+    return re.sub(r"[^a-z0-9._-]+", "-", os.path.basename(os.path.normpath(path)).lower()).strip("-.") or fallback
 
 
 def user_exists(name: str) -> bool:
@@ -451,6 +599,24 @@ def cmd_services(args) -> int:
         if auto or ask_yes("  Monitor it?", True):
             name = pw.pw_name if auto else ask_name(pw.pw_name, taken)
             services.append(Service(name, "quadlet", "podman", pw.pw_name, pw.pw_dir))
+            taken.add(name)
+
+    # Containers that systemd units start in other accounts (quadlets outside
+    # /srv, e.g. a deployment that installs its quadlets in a user's
+    # ~/.config/containers/systemd), one service per project directory.
+    for owner, project, units in running_systemd_projects():
+        if any(s.deployment == "quadlet" and s.owner == owner and is_under(project, s.path) for s in services):
+            continue
+        whole_user = same_path(project, pwd.getpwnam(owner).pw_dir)
+        what = f"Podman containers of {owner}" if whole_user else f"Podman project {project} (user {owner})"
+        print(f"{what}, started by systemd: {', '.join(units)}")
+        if auto or ask_yes("  Monitor it?", True):
+            name = default_name(project, owner)
+            if auto:
+                name = name if name not in taken else f"{name}-{len(taken)}"
+            else:
+                name = ask_name(name, taken)
+            services.append(Service(name, "quadlet", "podman", owner, project))
             taken.add(name)
 
     # Compose projects
@@ -557,7 +723,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="humlab-agents", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("services", help="find and register services")
-    p.add_argument("--yes", action="store_true", help="register quadlet users and running compose projects without asking")
+    p.add_argument("--yes", action="store_true", help="register quadlet users, systemd-started projects and running compose projects without asking")
     p.set_defaults(func=cmd_services)
     sub.add_parser("list", help="show registered services").set_defaults(func=cmd_list)
     p = sub.add_parser("inventory", help="write the container-to-service table for Vector")
