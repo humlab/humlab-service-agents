@@ -26,6 +26,7 @@ UNIT_DIR=/etc/systemd/system
 DOCKER_DROPIN=$UNIT_DIR/humlab-vector.service.d/docker.conf
 CLI=/usr/local/bin/humlab-agents
 TIMERS=(humlab-inventory.timer humlab-sbom.timer)
+ENROLLED=0
 UNITS=(humlab-vector.service humlab-inventory.service humlab-inventory.timer humlab-sbom.service humlab-sbom.timer)
 
 # Agents the previous per-user installer put in each service user's home, and a
@@ -57,23 +58,6 @@ ask_yes() {
     read -r -p "$prompt $([ "$default" = y ] && echo '[Y/n]' || echo '[y/N]'): " answer || true
     answer=${answer:-$default}
     [[ $answer =~ ^[Yy] ]]
-}
-
-# Reads a secret into a root-only file. Enter keeps the current one.
-ask_secret() {
-    local prompt=$1 file=$2 value=""
-    while :; do
-        if [ -s "$file" ]; then
-            read -r -s -p "$prompt (Enter keeps the current one): " value || true
-        else
-            read -r -s -p "$prompt: " value || true
-        fi
-        echo >&2
-        [ -n "$value" ] && break
-        [ -s "$file" ] && return 0
-        echo "A value is required." >&2
-    done
-    (umask 077 && printf '%s' "$value" >"$file")
 }
 
 # Current value of KEY in agents.env, or the default.
@@ -167,15 +151,11 @@ configure() {
 
     echo
     echo "=== Server and endpoints ==="
-    host=$(ask "Short name of this server (as in the blackbox allowlist)" "$(env_get HOST_NAME "$(hostname -s)")")
+    host=$(ask "Short name of this server (its name on blackbox)" "$(env_get HOST_NAME "$(hostname -s)")")
     [[ $host =~ ^[a-z0-9][a-z0-9.-]*$ ]] || fail "Server name must be lowercase letters, digits, '.' or '-'"
     domain=$(ask "Blackbox domain" "$(env_get DOMAIN "$DEFAULT_DOMAIN")")
 
-    echo
-    echo "Credentials are created on blackbox (see README.md). Each goes in a root-only file in $SECRETS_DIR."
-    ask_secret "OpenSearch password for ingest-$host" "$SECRETS_DIR/opensearch.password"
-    ask_secret "Prometheus push password for metrics-$host" "$SECRETS_DIR/prometheus.password"
-    ask_secret "Dependency-Track API key" "$SECRETS_DIR/dtrack.apikey"
+    enroll "$host" "$domain"
 
     local tmp
     tmp=$(mktemp "$ENV_FILE.XXXXXX")
@@ -205,6 +185,64 @@ INVENTORY=/var/lib/humlab-agents/inventory.csv
 EOF
     chmod 644 "$tmp"
     mv "$tmp" "$ENV_FILE"
+}
+
+# Enrolls this server with blackbox, which creates its accounts there,
+# allowlists the address it calls from, and returns the credentials. Needs a
+# one-time key (on blackbox: ./enroll/enroll.sh key new). Enrolling again with
+# a new key replaces all three credentials.
+enroll() {
+    local host=$1 domain=$2 key response code have=1 f
+    for f in opensearch.password prometheus.password dtrack.apikey; do
+        [ -s "$SECRETS_DIR/$f" ] || have=0
+    done
+
+    echo
+    echo "=== Enrollment ==="
+    while :; do
+        if [ $have = 1 ]; then
+            read -r -s -p "Enrollment key (Enter keeps the current credentials): " key || true
+        else
+            read -r -s -p "Enrollment key (on blackbox: ./enroll/enroll.sh key new): " key || true
+        fi
+        echo >&2
+        [ -n "$key" ] && break
+        [ $have = 1 ] && return 0
+        echo "A key is required." >&2
+    done
+
+    response=$(mktemp)
+    # The key goes in as a curl config on stdin (-K -) so it never shows in ps.
+    code=$(printf 'header = "Authorization: Bearer %s"\n' "$key" | curl -sS -o "$response" -w '%{http_code}' \
+        --max-time 120 -K - -H 'Content-Type: application/json' --data "{\"name\": \"$host\"}" \
+        "https://enroll.$domain/v1/enroll") || true
+    if [ "$code" != 200 ]; then
+        local error
+        error=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("error", ""))' "$response" 2>/dev/null || true)
+        rm -f "$response"
+        case $code in
+            000) fail "Could not reach https://enroll.$domain (is this server's address allowed in blackbox's humlab-enroll-allow.conf?)" ;;
+            403) [ -n "$error" ] || error="this server's address may not use the enrollment service" ;;
+            429) error="too many attempts, wait a minute" ;;
+        esac
+        fail "Enrollment failed (HTTP $code): ${error:-no details}"
+    fi
+    python3 - "$response" "$SECRETS_DIR" <<'PY' || { rm -f "$response"; fail "Unexpected answer from the enrollment service"; }
+import json, os, sys
+r = json.load(open(sys.argv[1]))
+secrets = {"opensearch.password": r["opensearch"]["password"],
+           "prometheus.password": r["prometheus"]["password"],
+           "dtrack.apikey": r["dtrack"]["api_key"]}
+os.umask(0o077)
+for name, value in secrets.items():
+    path = os.path.join(sys.argv[2], name)
+    with open(path + ".new", "w") as f:
+        f.write(value)
+    os.replace(path + ".new", path)
+print(f"[install] Enrolled as {r['server']} from {r['ip']}; credentials saved in {sys.argv[2]}", file=sys.stderr)
+PY
+    rm -f "$response"
+    ENROLLED=1
 }
 
 set_env() {
@@ -361,6 +399,13 @@ check_connections() {
     echo
     echo "=== Connection checks ==="
     code=$(http_code "$os_url/" "user = \"ingest-$host:$(cat "$SECRETS_DIR/opensearch.password")\"")
+    # Right after enrolling, blackbox may need a few seconds to allowlist this server.
+    local tries=0
+    while [ "$ENROLLED" = 1 ] && [ "$code" = 403 ] && [ $tries -lt 10 ]; do
+        sleep 3
+        tries=$((tries + 1))
+        code=$(http_code "$os_url/" "user = \"ingest-$host:$(cat "$SECRETS_DIR/opensearch.password")\"")
+    done
     case $code in
         200) echo "  OpenSearch:       OK" ;;
         401) echo "  OpenSearch:       wrong user or password (ingest-$host)"; ok=0 ;;

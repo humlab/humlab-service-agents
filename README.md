@@ -37,20 +37,19 @@ recreate the containers) and re-run the installer.
 **Podman** logs to journald by default. A container started with
 `--log-driver k8s-file` (or `LogDriver=k8s-file` in a quadlet) is not collected.
 
-## Before installing: on blackbox
+## Before installing: an enrollment key
 
-Each server needs an allowlist entry and two users. On blackbox, as described in
-`nginx/README.md` of the humlab-service-agent-servers repo:
+Get a one-time enrollment key from blackbox's service user:
 
 ```bash
-sudoedit /etc/nginx/humlab-ingest-allow.conf   # allow <server-ip>;
-./opensearch/opensearch-users.sh add <server>  # -> ingest-<server>
-./monitor/prometheus-push-users.sh add <server> # -> metrics-<server>
+./enroll/enroll.sh key new      # in the humlab-service-agent-servers repo
 ```
 
-`<server>` is the short host name (`hostname -s`). You also need a
-Dependency-Track API key with the permissions `BOM_UPLOAD` and
-`PROJECT_CREATION_UPLOAD`; one key can serve all servers.
+The installer uses it to enroll the server. Blackbox then creates the server's
+accounts (OpenSearch, Prometheus push and a Dependency-Track API key) and
+allowlists the address the server calls from. Nothing else needs to be set up
+by hand. A key works once and expires after 7 days. See
+`nginx/README.md` in the servers repo.
 
 ## Install
 
@@ -64,15 +63,18 @@ The installer:
 
 1. Downloads Vector and Syft (pinned versions, checksums verified) to
    `/usr/local/lib/humlab-agents/bin/`.
-2. Asks for the server name, the blackbox domain and the three secrets. Enter
-   keeps the earlier answer when you re-run it.
+2. Asks for the server name, the blackbox domain and the enrollment key, and
+   enrolls the server. Enter keeps the earlier answers, and the current
+   credentials, when you re-run it.
 3. Finds services and asks which to monitor (next section).
 4. Offers to remove the old per-user agent containers, if a service user still
    has them.
 5. Starts the agents and checks that OpenSearch, Prometheus and
    Dependency-Track accept the credentials from this server.
 
-Re-run `sudo ./install.sh` to update. It needs a systemd of version 247 or later,
+Re-run `sudo ./install.sh` to update. To get new credentials, re-run it with a new
+key; this works from the address the server enrolled from. A server that has
+moved to a new address needs a key made with `key new --server <name>`. It needs a systemd of version 247 or later,
 Python 3.9 or later, and Podman or Docker.
 
 ## Services
@@ -144,7 +146,7 @@ journalctl -u humlab-vector -f              # agent log
 |---|---|
 | `/etc/humlab-agents/agents.env` | Server name, endpoints, host-log filter. Re-run the installer after editing. |
 | `/etc/humlab-agents/services.conf` | Service registry |
-| `/etc/humlab-agents/secrets/` | Passwords and API key (root only) |
+| `/etc/humlab-agents/secrets/` | Passwords and API key from enrollment (root only) |
 | `/etc/humlab-agents/vector/` | Rendered Vector config |
 | `/var/lib/humlab-agents/inventory.csv` | Container to service map |
 | `/var/lib/humlab-vector/` | Journal position and disk buffers (up to about 1.3 GB) |
