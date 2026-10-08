@@ -120,10 +120,19 @@ path = /data/sead_query_api
   change the list), and you can add other directories by hand. Containers belong
   to the project when their `com.docker.compose.project.working_dir` label is
   that directory. Docker Compose and podman-compose both set it. A `project =`
-  line matches on the project name instead.
+  line matches on the project name instead. The installer writes that line
+  when the label doesn't lead to a directory but the project name does: the
+  directory's name, `name:` in the compose file, or `COMPOSE_PROJECT_NAME`
+  in `.env`.
 - **Owner**: the user whose Podman runs the containers, or `root` for Docker and
   rootful Podman. A rootless owner needs lingering (`loginctl enable-linger
   <user>`) so its containers and runtime directory exist without a login.
+
+The installer looks for containers in Docker, rootful Podman, and the Podman of
+every user who has running containers (found by their `conmon` processes) or a
+runtime directory. It warns about a user whose running containers it cannot
+list, usually because lingering is off. Then it lists the running containers
+that no registered service covers, so you can add their directories by hand.
 
 Run `sudo ./install.sh services` to look again after deploying something new.
 Containers that belong to no registered service are still logged and measured,

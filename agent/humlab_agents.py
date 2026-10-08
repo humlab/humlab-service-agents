@@ -45,6 +45,7 @@ SEARCH_DEPTH = 4
 # Containers started by a systemd unit (quadlet, or podman generate systemd)
 # carry this label. The unit's source file leads to the project directory.
 SYSTEMD_UNIT_LABEL = "PODMAN_SYSTEMD_UNIT"
+WORKING_DIR_LABEL = "com.docker.compose.project.working_dir"
 PROJECT_MARKERS = (".git", ".env") + COMPOSE_FILES
 SYSTEM_PATHS = ("/etc/", "/run/", "/var/run/", "/proc/", "/sys/", "/dev/", "/tmp/", "/usr/")
 
@@ -75,7 +76,7 @@ class Service:
 
     def matches(self, labels: dict) -> bool:
         """True if a compose container (by its labels) belongs to this service."""
-        wd = labels.get("com.docker.compose.project.working_dir")
+        wd = labels.get(WORKING_DIR_LABEL)
         if wd and same_path(wd, self.path):
             return True
         return labels.get("com.docker.compose.project") == self.compose_project
@@ -164,8 +165,9 @@ def list_containers(runtime: str, owner: str) -> list:
             for c in json.loads(run_as(owner, ["docker", "inspect", *ids]).stdout)]
 
 
-def attach_containers(services: list) -> None:
-    """Fill each service's .containers from its runtime.
+def attach_containers(services: list, listed: dict = None) -> None:
+    """Fill each service's .containers from its runtime, or from listed
+    ((runtime, owner) -> containers, see running_containers) when given.
 
     Compose services claim containers by their compose labels. A quadlet
     service claims the containers whose systemd unit comes from its directory
@@ -179,12 +181,15 @@ def attach_containers(services: list) -> None:
         s.containers = []
         groups.setdefault((s.runtime, s.owner), []).append(s)
     for (runtime, owner), group in groups.items():
-        try:
-            containers = list_containers(runtime, owner)
-        except (RuntimeError, KeyError, subprocess.SubprocessError, OSError, ValueError) as e:
-            detail = getattr(e, "stderr", "") or e
-            log(f"WARNING: cannot list {runtime} containers for {owner}: {str(detail).strip()}")
-            continue
+        if listed is not None:
+            containers = listed.get((runtime, owner), [])
+        else:
+            try:
+                containers = list_containers(runtime, owner)
+            except (RuntimeError, KeyError, subprocess.SubprocessError, OSError, ValueError) as e:
+                detail = getattr(e, "stderr", "") or e
+                log(f"WARNING: cannot list {runtime} containers for {owner}: {str(detail).strip()}")
+                continue
         compose = [s for s in group if s.deployment == "compose"]
         quadlet = [s for s in group if s.deployment == "quadlet"]
         projects = systemd_projects(owner, containers) if runtime == "podman" and quadlet else {}
@@ -507,49 +512,128 @@ def find_compose_dirs(roots: list) -> list:
     return sorted(set(found))
 
 
-def container_runtimes() -> list:
-    """(runtime, owner) for Docker, rootful Podman and every user Podman with a runtime dir."""
+def conmon_uids() -> set:
+    """Users with running Podman containers: each container has a conmon process
+    running as the user whose Podman started it."""
+    uids = set()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                if f.read().strip() not in ("conmon", "conmonrs"):
+                    continue
+            uids.add(os.stat(f"/proc/{pid}").st_uid)
+        except OSError:
+            pass
+    return uids
+
+
+def container_runtimes(busy: set) -> list:
+    """(runtime, owner) for Docker, rootful Podman, and the rootless Podman of every
+    user with a runtime dir or running containers (busy: their uids)."""
     sources = []
     if shutil.which("docker") and os.path.exists("/var/run/docker.sock"):
         sources.append(("docker", "root"))
     if shutil.which("podman"):
         sources.append(("podman", "root"))
-        for entry in sorted(os.listdir("/run/user")) if os.path.isdir("/run/user") else []:
+        uids = set(busy)
+        if os.path.isdir("/run/user"):
+            uids |= {int(e) for e in os.listdir("/run/user") if e.isdigit()}
+        for uid in sorted(uids - {0}):
             try:
-                sources.append(("podman", pwd.getpwuid(int(entry)).pw_name))
-            except (ValueError, KeyError):
+                sources.append(("podman", pwd.getpwuid(uid).pw_name))
+            except KeyError:
                 pass
     return sources
 
 
-def running_compose_projects() -> dict:
-    """realpath(working dir) -> (runtime, owner, project) for running compose containers."""
-    projects = {}
-    for runtime, owner in container_runtimes():
+def running_containers() -> dict:
+    """(runtime, owner) -> running containers, for every runtime on the host. Warns
+    about each runtime that has containers running but cannot be listed; those
+    would be missing from discovery, and from the inventory."""
+    busy = conmon_uids()
+    found = {}
+    for runtime, owner in container_runtimes(busy):
         try:
-            containers = list_containers(runtime, owner)
-        except (RuntimeError, subprocess.SubprocessError, OSError, ValueError):
-            continue
+            found[(runtime, owner)] = list_containers(runtime, owner)
+        except (RuntimeError, subprocess.SubprocessError, OSError, ValueError) as e:
+            if runtime == "docker" or pwd.getpwnam(owner).pw_uid in busy:
+                detail = getattr(e, "stderr", "") or e
+                log(f"WARNING: {owner} has running {runtime} containers, but they cannot be listed: "
+                    f"{str(detail).strip()}")
+    return found
+
+
+@dataclass
+class RunningProject:
+    """A compose project with running containers."""
+    runtime: str
+    owner: str
+    name: str                  # com.docker.compose.project
+    working_dir: str           # realpath of com.docker.compose.project.working_dir, or ''
+    containers: list
+
+    @property
+    def labels(self) -> dict:
+        return {"com.docker.compose.project": self.name, WORKING_DIR_LABEL: self.working_dir}
+
+
+def running_compose_projects(listed: dict) -> list:
+    projects = {}
+    for (runtime, owner), containers in listed.items():
         for c in containers:
-            wd = c["labels"].get("com.docker.compose.project.working_dir")
-            if wd:
-                projects.setdefault(os.path.realpath(wd), (runtime, owner, c["labels"].get("com.docker.compose.project", "")))
-    return projects
+            name = c["labels"].get("com.docker.compose.project")
+            if name:
+                wd = c["labels"].get(WORKING_DIR_LABEL, "")
+                key = (runtime, owner, name, os.path.realpath(wd) if wd else "")
+                projects.setdefault(key, []).append(c["name"])
+    return [RunningProject(*key, sorted(names)) for key, names in sorted(projects.items())]
 
 
-def running_systemd_projects() -> list:
+def declared_project_names(path: str) -> set:
+    """Names a compose directory's project may run under: the directory's name, the
+    compose file's top-level name:, and COMPOSE_PROJECT_NAME in .env."""
+    names = {compose_project_name(path)}
+    for f, pattern in [(f, r"^name:\s*['\"]?([^'\"\s#]+)") for f in COMPOSE_FILES] + \
+                      [(".env", r"^COMPOSE_PROJECT_NAME=\s*['\"]?([^'\"\s#]+)")]:
+        try:
+            text = Path(path, f).read_text(errors="replace")
+        except OSError:
+            continue
+        names |= {m.group(1).lower() for m in re.finditer(pattern, text, re.M) if "$" not in m.group(1)}
+    return names
+
+
+def find_running_project(path: str, running: list, services: list):
+    """(project, how it matched) for the running project that a compose directory
+    holds, or (None, ''). The working-dir label decides when it leads to a
+    directory; otherwise a project name the directory declares, if no
+    registered service has that project yet, preferring the directory's owner."""
+    real = os.path.realpath(path)
+    exact = next((p for p in running if p.working_dir == real), None)
+    if exact:
+        return exact, "working directory"
+    names = declared_project_names(path)
+    loose = [p for p in running if p.name in names
+             and not (p.working_dir and os.path.isdir(p.working_dir))
+             and not any(s.deployment == "compose" and (s.runtime, s.owner) == (p.runtime, p.owner)
+                         and s.matches(p.labels) for s in services)]
+    dir_owner = pwd.getpwuid(os.stat(path).st_uid).pw_name
+    loose.sort(key=lambda p: p.owner != dir_owner)
+    return (loose[0], f"project name '{loose[0].name}'") if loose else (None, "")
+
+
+def running_systemd_projects(listed: dict) -> list:
     """(owner, project directory, units) for running Podman containers that systemd
     units started, in any account. A project nested in another (a repository
     checked out inside a deployment) counts as the outer one. Units whose project
     cannot be told go to the owner's only project, or else count as the owner's home."""
     found = []
-    for runtime, owner in container_runtimes():
+    for (runtime, owner), containers in listed.items():
         if runtime != "podman":
             continue
-        try:
-            containers = [c for c in list_containers(runtime, owner) if c["labels"].get(SYSTEMD_UNIT_LABEL)]
-        except (RuntimeError, subprocess.SubprocessError, OSError, ValueError):
-            continue
+        containers = [c for c in containers if c["labels"].get(SYSTEMD_UNIT_LABEL)]
         projects = systemd_projects(owner, containers)
         known = {p for p in projects.values() if p}
         outer = {p: min((q for q in known if is_under(p, q)), key=len) for p in known}
@@ -561,6 +645,25 @@ def running_systemd_projects() -> list:
             groups.setdefault(project, set()).add(c["labels"][SYSTEMD_UNIT_LABEL].removesuffix(".service"))
         found += [(owner, project, sorted(units)) for project, units in sorted(groups.items())]
     return found
+
+
+def uncovered_containers(services: list, listed: dict) -> list:
+    """Running containers that no service claims, by the same matching as the
+    inventory: one line per owner and compose project."""
+    attach_containers(services, listed)
+    claimed = {c["id"] for s in services for c in s.containers}
+    groups = {}
+    for (runtime, owner), containers in sorted(listed.items()):
+        for c in containers:
+            if c["id"] not in claimed:
+                key = (owner, runtime, c["labels"].get("com.docker.compose.project", ""),
+                       c["labels"].get(WORKING_DIR_LABEL, ""))
+                groups.setdefault(key, []).append(c["name"])
+    lines = []
+    for (owner, runtime, project, wd), names in groups.items():
+        what = f"compose project {project}{f' in {wd}' if wd else ''}: " if project else ""
+        lines.append(f"{owner} ({runtime}): {what}{', '.join(sorted(names))}")
+    return lines
 
 
 def default_name(path: str, fallback: str) -> str:
@@ -618,10 +721,12 @@ def cmd_services(args) -> int:
             services.append(Service(name, "quadlet", "podman", pw.pw_name, pw.pw_dir))
             taken.add(name)
 
+    listed = running_containers()
+
     # Containers that systemd units start in other accounts (quadlets outside
     # /srv, e.g. a deployment that installs its quadlets in a user's
     # ~/.config/containers/systemd), one service per project directory.
-    for owner, project, units in running_systemd_projects():
+    for owner, project, units in running_systemd_projects(listed):
         if any(s.deployment == "quadlet" and s.owner == owner and is_under(project, s.path) for s in services):
             continue
         whole_user = same_path(project, pwd.getpwnam(owner).pw_dir)
@@ -640,16 +745,15 @@ def cmd_services(args) -> int:
     roots = [r for r in DEFAULT_ROOTS if os.path.isdir(r)]
     if not auto:
         roots = ask("Directories to search for compose files", " ".join(roots)).split()
-    running = running_compose_projects()
+    running = running_compose_projects(listed)
     quadlet_homes = [os.path.realpath(s.path) for s in services if s.deployment == "quadlet"]
     candidates = [d for d in find_compose_dirs(roots)
                   if ("compose", os.path.realpath(d)) not in registered_paths
                   and not any(os.path.realpath(d).startswith(h + "/") for h in quadlet_homes)]
 
-    def add_compose(path: str, interactive: bool) -> None:
-        info = running.get(os.path.realpath(path))
+    def add_compose(path: str, info, interactive: bool) -> None:
         if info:
-            runtime, owner, project = info
+            runtime, owner, project = info.runtime, info.owner, info.name
         else:
             runtime, owner, project = "", pwd.getpwuid(os.stat(path).st_uid).pw_name, compose_project_name(path)
         default_name = project or compose_project_name(path)
@@ -664,6 +768,7 @@ def cmd_services(args) -> int:
                 owner = ask("  Owner (the user who runs it; root for docker or rootful podman)", owner)
                 while not user_exists(owner):
                     owner = ask(f"  No user '{owner}'. Owner", "root")
+                project = ask("  Compose project name (the prefix of its container names)", project)
         if runtime not in ("podman", "docker"):
             print(f"  Skipped {path}: unknown runtime '{runtime}'")
             return
@@ -672,14 +777,25 @@ def cmd_services(args) -> int:
         taken.add(name)
 
     for d in candidates:
-        info = running.get(os.path.realpath(d))
-        state = f"running under {info[0]} as {info[1]}" if info else "no running containers found"
+        info, how = find_running_project(d, running, services)
+        if info:
+            state = f"running under {info.runtime} as {info.owner}, matched by {how}"
+        else:
+            state = "no running containers found"
         print(f"Compose project {d} ({state})")
         if auto:
             if info:
-                add_compose(d, False)
+                add_compose(d, info, False)
         elif ask_yes("  Monitor it?", bool(info)):
-            add_compose(d, True)
+            add_compose(d, info, True)
+
+    # Everything the inventory would leave out, so it can be added by hand.
+    uncovered = uncovered_containers(services, listed)
+    if uncovered:
+        print("\nRunning containers that no service covers (logged under their own names, no SBOM):")
+        for line in uncovered:
+            print(f"  {line}")
+        print()
 
     if not auto:
         while True:
@@ -689,20 +805,23 @@ def cmd_services(args) -> int:
             if not any(os.path.isfile(os.path.join(path, f)) for f in COMPOSE_FILES):
                 print(f"  No compose file in {path}")
                 continue
-            add_compose(path, True)
+            info, how = find_running_project(path, running, services)
+            if info:
+                print(f"  Running under {info.runtime} as {info.owner}, matched by {how}")
+            add_compose(path, info, True)
 
         for s in list(services):
             if not os.path.isdir(s.path) and ask_yes(f"{s.name}: {s.path} no longer exists. Remove it?", True):
                 services.remove(s)
 
-    for s in services:
-        if s.runtime == "podman" and s.owner != "root" and user_exists(s.owner):
-            uid = pwd.getpwnam(s.owner).pw_uid
-            if not os.path.exists(f"/var/lib/systemd/linger/{s.owner}"):
-                print(f"NOTE: {s.owner} has no lingering; its containers stop at logout and cannot be "
-                      f"scanned while it is logged out. Fix: loginctl enable-linger {s.owner}")
+    for owner in sorted({s.owner for s in services if s.runtime == "podman" and s.owner != "root"}):
+        if user_exists(owner):
+            uid = pwd.getpwnam(owner).pw_uid
+            if not os.path.exists(f"/var/lib/systemd/linger/{owner}"):
+                print(f"NOTE: {owner} has no lingering; its containers stop at logout and cannot be "
+                      f"scanned while it is logged out. Fix: loginctl enable-linger {owner}")
             elif not os.path.isdir(f"/run/user/{uid}"):
-                print(f"NOTE: /run/user/{uid} for {s.owner} is missing")
+                print(f"NOTE: /run/user/{uid} for {owner} is missing")
 
     save_registry(services)
     print(f"Saved {len(services)} services to {REGISTRY}")
