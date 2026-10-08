@@ -422,8 +422,9 @@ check_connections() {
         *)   echo "  Prometheus push:  no answer (HTTP $code) from $prom_url"; ok=0 ;;
     esac
 
-    # Polling an unknown upload token needs BOM_UPLOAD and returns 200.
-    code=$(http_code "$dt_url/api/v1/bom/token/00000000-0000-0000-0000-000000000000" \
+    # Polling an unknown upload token needs BOM_UPLOAD and returns 200. The
+    # token must be a valid v4 UUID; the nil UUID gets 400.
+    code=$(http_code "$dt_url/api/v1/bom/token/6f1c2d3e-4b5a-4c7d-8e9f-0a1b2c3d4e5f" \
         "header = \"X-Api-Key: $(cat "$SECRETS_DIR/dtrack.apikey")\"")
     case $code in
         200) echo "  Dependency-Track: OK" ;;
