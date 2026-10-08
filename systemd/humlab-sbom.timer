@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily SBOM scan for Dependency-Track
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,342 +1,450 @@
 #!/usr/bin/env bash
+#
+# Install the Humlab telemetry agents on one server. Run as root:
+#
+#   sudo ./install.sh             Install or update. Safe to re-run; keeps earlier answers.
+#   sudo ./install.sh services    Look for services again and update the registry.
+#   sudo ./install.sh status      Show what is running and recent problems.
+#   sudo ./install.sh uninstall   Stop and remove the agents (keeps /etc/humlab-agents).
+#
+# Works the same on quadlet, podman-compose and docker-compose servers; see README.md.
+
 set -euo pipefail
 
-# --- Configurable destinations (under ~) ---
-DEST_BASE="$HOME/configuration"
-DEST_IMAGE_BUILD_DTRACK="$DEST_BASE/image_builds/dtrack-agent"
-DEST_IMAGE_BUILD_OPENSEARCH="$DEST_BASE/image_builds/opensearch-agent"
-DEST_IMAGE_BUILD_CADVISOR="$DEST_BASE/image_builds/cadvisor-agent"
-DEST_QUADLETS="$DEST_BASE/quadlets"
-DEST_SECRETS="$DEST_BASE/secrets"
-DEST_ENV_FILE_DTRACK="$DEST_SECRETS/dtrack.env"
-DEST_ENV_FILE_OPENSEARCH="$DEST_SECRETS/opensearch.env"
-DEST_ENV_FILE_CADVISOR="$DEST_SECRETS/cadvisor.env"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VECTOR_VERSION=0.59.0
+SYFT_VERSION=1.54.1
+DEFAULT_DOMAIN=blackbox.humlab.umu.se
 
-# Quadlet systemd directory
-QUADLET_SYSTEMD_DIR="$HOME/.config/containers/systemd"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR=/usr/local/lib/humlab-agents
+BIN_DIR=$LIB_DIR/bin
+CONF_DIR=/etc/humlab-agents
+SECRETS_DIR=$CONF_DIR/secrets
+VECTOR_CONF_DIR=$CONF_DIR/vector
+ENV_FILE=$CONF_DIR/agents.env
+UNIT_DIR=/etc/systemd/system
+DOCKER_DROPIN=$UNIT_DIR/humlab-vector.service.d/docker.conf
+CLI=/usr/local/bin/humlab-agents
+TIMERS=(humlab-inventory.timer humlab-sbom.timer)
+UNITS=(humlab-vector.service humlab-inventory.service humlab-inventory.timer humlab-sbom.service humlab-sbom.timer)
+
+# Agents the previous per-user installer put in each service user's home, and a
+# line that only its env file for that agent contains. Env files are deleted
+# only when they match: other services use the same names (blackbox's own
+# configuration/secrets/opensearch.env holds the OpenSearch admin password).
+LEGACY_UNITS=(dtrack-agent opensearch-agent cadvisor-agent)
+declare -A LEGACY_ENV_MARKER=(
+    [dtrack-agent]='^DT_API_KEY='
+    [opensearch-agent]='^AGENT_MODE'
+    [cadvisor-agent]='^PODMAN_HOST=unix:///run/podman/podman.sock$'
+)
 
 # --- Helpers ---
-log() {
-    echo "[install] $*" >&2
-}
 
-fail() { log "ERROR: $*"; exit 1; }
-
+log() { echo "[install] $*" >&2; }
+warn() { echo "[install] WARNING: $*" >&2; }
+fail() { echo "[install] ERROR: $*" >&2; exit 1; }
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-prompt_with_default() {
-    local prompt="$1"
-    local default="$2"
-    local var
-    if [ -n "$default" ]; then
-        read -r -p "$prompt [$default]: " var || true
-        echo "${var:-$default}"
+ask() {
+    local prompt=$1 default=${2:-} answer
+    read -r -p "$prompt${default:+ [$default]}: " answer || true
+    echo "${answer:-$default}"
+}
+
+ask_yes() {
+    local prompt=$1 default=$2 answer
+    read -r -p "$prompt $([ "$default" = y ] && echo '[Y/n]' || echo '[y/N]'): " answer || true
+    answer=${answer:-$default}
+    [[ $answer =~ ^[Yy] ]]
+}
+
+# Reads a secret into a root-only file. Enter keeps the current one.
+ask_secret() {
+    local prompt=$1 file=$2 value=""
+    while :; do
+        if [ -s "$file" ]; then
+            read -r -s -p "$prompt (Enter keeps the current one): " value || true
+        else
+            read -r -s -p "$prompt: " value || true
+        fi
+        echo >&2
+        [ -n "$value" ] && break
+        [ -s "$file" ] && return 0
+        echo "A value is required." >&2
+    done
+    (umask 077 && printf '%s' "$value" >"$file")
+}
+
+# Current value of KEY in agents.env, or the default.
+env_get() {
+    local value=""
+    [ -f "$ENV_FILE" ] && value=$(sed -n "s/^$1=//p" "$ENV_FILE" | tail -1)
+    echo "${value:-$2}"
+}
+
+# --- Preflight ---
+
+preflight() {
+    [ "$(id -u)" -eq 0 ] || fail "Run as root: sudo $0 ${1:-}"
+    [ -d /run/systemd/system ] || fail "systemd is not running"
+    local c
+    for c in curl tar sha256sum python3 getent useradd install systemctl journalctl; do
+        have_cmd "$c" || fail "Missing required command: $c"
+    done
+    # subprocess.run(user=...) needs 3.9
+    python3 -c 'import sys; assert sys.version_info >= (3, 9)' 2>/dev/null || fail "python3 >= 3.9 is required"
+    # LoadCredential= needs systemd 247
+    local sd_version
+    sd_version=$(systemctl --version | awk 'NR==1 {print $2}')
+    [ "${sd_version%%.*}" -ge 247 ] 2>/dev/null || fail "systemd >= 247 is required (found $sd_version)"
+    getent group systemd-journal >/dev/null || fail "group systemd-journal does not exist"
+    have_cmd podman || have_cmd docker || fail "Neither podman nor docker is installed"
+
+    case "$(uname -m)" in
+        x86_64)  VECTOR_ARCH=x86_64-unknown-linux-musl;  SYFT_ARCH=amd64 ;;
+        aarch64) VECTOR_ARCH=aarch64-unknown-linux-musl; SYFT_ARCH=arm64 ;;
+        *) fail "Unsupported architecture: $(uname -m)" ;;
+    esac
+
+    [ -d /var/log/journal ] || warn "The journal is not persistent (/var/log/journal is missing). Logs written while the agent is down are lost at reboot."
+}
+
+# --- Binaries ---
+
+# download_verified <url> <checksums-url> <dir>: fetches the file and checks it
+# against the release's checksum list.
+download_verified() {
+    local url=$1 sums_url=$2 dir=$3 file
+    file=$(basename "$url")
+    curl -sSfL --retry 3 -o "$dir/$file" "$url" || fail "Download failed: $url"
+    curl -sSfL --retry 3 -o "$dir/SUMS" "$sums_url" || fail "Download failed: $sums_url"
+    (cd "$dir" && grep -E " \*?$file\$" SUMS | sha256sum -c --quiet -) || fail "Checksum mismatch for $file"
+}
+
+install_binaries() {
+    local tmp
+    tmp=$(mktemp -d)
+    install -d -m 755 "$BIN_DIR"
+
+    if "$BIN_DIR/vector" --version 2>/dev/null | grep -q "^vector $VECTOR_VERSION "; then
+        log "Vector $VECTOR_VERSION already installed"
     else
-        read -r -p "$prompt: " var || true
-        echo "$var"
+        log "Installing Vector $VECTOR_VERSION"
+        local base=https://github.com/vectordotdev/vector/releases/download/v$VECTOR_VERSION
+        download_verified "$base/vector-$VECTOR_VERSION-$VECTOR_ARCH.tar.gz" "$base/vector-$VECTOR_VERSION-SHA256SUMS" "$tmp"
+        tar -xzf "$tmp/vector-$VECTOR_VERSION-$VECTOR_ARCH.tar.gz" -C "$tmp"
+        install -m 755 "$tmp/vector-$VECTOR_ARCH/bin/vector" "$BIN_DIR/vector"
+    fi
+
+    if "$BIN_DIR/syft" version 2>/dev/null | grep -qE "^Version: +$SYFT_VERSION$"; then
+        log "Syft $SYFT_VERSION already installed"
+    else
+        log "Installing Syft $SYFT_VERSION"
+        local base=https://github.com/anchore/syft/releases/download/v$SYFT_VERSION
+        download_verified "$base/syft_${SYFT_VERSION}_linux_$SYFT_ARCH.tar.gz" "$base/syft_${SYFT_VERSION}_checksums.txt" "$tmp"
+        tar -xzf "$tmp/syft_${SYFT_VERSION}_linux_$SYFT_ARCH.tar.gz" -C "$tmp" syft
+        install -m 755 "$tmp/syft" "$BIN_DIR/syft"
+    fi
+    rm -rf -- "$tmp"
+}
+
+create_users() {
+    local u
+    for u in humlab-vector humlab-sbom; do
+        id -u "$u" >/dev/null 2>&1 && continue
+        log "Creating system user $u"
+        useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$u"
+    done
+}
+
+# --- Configuration ---
+
+configure() {
+    local host domain
+    install -d -m 755 "$CONF_DIR" "$VECTOR_CONF_DIR"
+    install -d -m 700 "$SECRETS_DIR"
+
+    echo
+    echo "=== Server and endpoints ==="
+    host=$(ask "Short name of this server (as in the blackbox allowlist)" "$(env_get HOST_NAME "$(hostname -s)")")
+    [[ $host =~ ^[a-z0-9][a-z0-9.-]*$ ]] || fail "Server name must be lowercase letters, digits, '.' or '-'"
+    domain=$(ask "Blackbox domain" "$(env_get DOMAIN "$DEFAULT_DOMAIN")")
+
+    echo
+    echo "Credentials are created on blackbox (see README.md). Each goes in a root-only file in $SECRETS_DIR."
+    ask_secret "OpenSearch password for ingest-$host" "$SECRETS_DIR/opensearch.password"
+    ask_secret "Prometheus push password for metrics-$host" "$SECRETS_DIR/prometheus.password"
+    ask_secret "Dependency-Track API key" "$SECRETS_DIR/dtrack.apikey"
+
+    local tmp
+    tmp=$(mktemp "$ENV_FILE.XXXXXX")
+    cat >"$tmp" <<EOF
+# Humlab agents: settings for this server. Written by install.sh; re-run it after
+# editing so the Vector config is rendered again. Secrets live in $SECRETS_DIR.
+HOST_NAME=$host
+DOMAIN=$domain
+OPENSEARCH_URL=https://api.opensearch.$domain
+OPENSEARCH_USER=ingest-$host
+PROMETHEUS_URL=https://api.prometheus.$domain/api/v1/write
+PROMETHEUS_USER=metrics-$host
+DT_URL=https://api.dtrack.$domain
+
+# Host (non-container) journal entries sent to logs-syslog-*: priority 4
+# (warning) and worse, plus everything from these units.
+HOST_LOG_MAX_PRIORITY=$(env_get HOST_LOG_MAX_PRIORITY 4)
+HOST_LOG_UNITS=$(env_get HOST_LOG_UNITS "ssh.service sshd.service")
+
+# Docker container logs when Docker does not log to journald: api or skip.
+DOCKER_LOGS=$(env_get DOCKER_LOGS "")
+
+# Paths used in the Vector config.
+DATA_DIR=/var/lib/humlab-vector
+CREDENTIALS_DIR=/run/credentials/humlab-vector.service
+INVENTORY=/var/lib/humlab-agents/inventory.csv
+EOF
+    chmod 644 "$tmp"
+    mv "$tmp" "$ENV_FILE"
+}
+
+set_env() {
+    sed -i "s|^$1=.*|$1=$2|" "$ENV_FILE"
+}
+
+# Docker's default json-file driver keeps logs out of the journal. The Docker
+# API can still read them, but access to the Docker socket is root-equivalent,
+# so it is the admin's call.
+configure_docker_logs() {
+    rm -f "$VECTOR_CONF_DIR/docker-logs.yaml"
+    have_cmd docker || return 0
+    local driver choice
+    driver=$(docker info --format '{{.LoggingDriver}}' 2>/dev/null || true)
+    if [ "$driver" = journald ]; then
+        log "Docker logs to journald; container logs are collected from the journal"
+        set_env DOCKER_LOGS skip
+    else
+        choice=$(env_get DOCKER_LOGS "")
+        if [ -z "$choice" ]; then
+            echo
+            echo "=== Docker container logs ==="
+            echo "Docker logs to '${driver:-unknown}', not journald. Either:"
+            echo "  api   read them through the Docker API. Adds humlab-vector to the docker group,"
+            echo "        which is root-equivalent."
+            echo "  skip  don't collect Docker container logs. To collect them later without extra"
+            echo "        privileges, set \"log-driver\": \"journald\" in /etc/docker/daemon.json,"
+            echo "        restart Docker, recreate the containers and re-run install.sh."
+            choice=$(ask "api or skip" skip)
+        fi
+        case "$choice" in
+            api)  install -m 640 -o root -g humlab-vector "$SCRIPT_DIR/vector/docker-logs.yaml" "$VECTOR_CONF_DIR/" ;;
+            skip) ;;
+            *) fail "Answer api or skip" ;;
+        esac
+        set_env DOCKER_LOGS "$choice"
+    fi
+    if [ "$(env_get DOCKER_LOGS skip)" = api ]; then
+        install -d -m 755 "$(dirname "$DOCKER_DROPIN")"
+        # Adds to the unit's SupplementaryGroups (systemd-journal).
+        printf '[Service]\nSupplementaryGroups=docker\n' >"$DOCKER_DROPIN"
+    else
+        rm -f "$DOCKER_DROPIN"
     fi
 }
 
-prompt_required_secret() {
-    local prompt="$1"
-    local value=""
-    while [ -z "$value" ]; do
-        echo -n "$prompt (required): " >&2
-        read -r value || true
-        if [ -z "$value" ]; then
-            echo "Value is required, please try again." >&2
+install_files() {
+    log "Installing agent files"
+    install -d -m 755 "$LIB_DIR" /var/lib/humlab-agents
+    install -m 755 "$SCRIPT_DIR/agent/humlab_agents.py" "$LIB_DIR/humlab_agents.py"
+    ln -sfn "$LIB_DIR/humlab_agents.py" "$CLI"
+
+    local rendered
+    rendered=$(mktemp)
+    "$CLI" render "$SCRIPT_DIR/vector/vector.yaml" "$ENV_FILE" >"$rendered" || { rm -f "$rendered"; fail "Could not render the Vector config"; }
+    install -m 640 -o root -g humlab-vector "$rendered" "$VECTOR_CONF_DIR/vector.yaml"
+    rm -f "$rendered"
+
+    local u
+    for u in "${UNITS[@]}"; do
+        install -m 644 "$SCRIPT_DIR/systemd/$u" "$UNIT_DIR/$u"
+    done
+}
+
+register_services() {
+    echo
+    echo "=== Services ==="
+    if [ -s "$CONF_DIR/services.conf" ]; then
+        "$CLI" list
+        ask_yes "Look for new services?" n || return 0
+    fi
+    "$CLI" services
+}
+
+# The old installer ran dtrack/opensearch/cadvisor agent containers in every
+# service user's account. Offer to remove them, including their copy of the
+# Dependency-Track API key.
+remove_legacy_agents() {
+    local home user uid found=() name
+    for home in /srv/*; do
+        [ -d "$home/.config/containers/systemd" ] || continue
+        for name in "${LEGACY_UNITS[@]}" egress; do
+            if [ -e "$home/.config/containers/systemd/$name.container" ] || [ -L "$home/.config/containers/systemd/$name.container" ] \
+                || [ -L "$home/.config/containers/systemd/$name.network" ]; then
+                found+=("$home")
+                break
+            fi
+        done
+    done
+    [ ${#found[@]} -gt 0 ] || return 0
+
+    echo
+    echo "=== Old per-user agents ==="
+    echo "These service users still run the previous agent containers (dtrack-agent, opensearch-agent, cadvisor-agent):"
+    printf '  %s\n' "${found[@]}"
+    ask_yes "Stop and remove them, with their images and env files (including the Dependency-Track API key copy)?" y || return 0
+
+    local env_file
+    for home in "${found[@]}"; do
+        user=$(stat -c %U "$home")
+        uid=$(id -u "$user" 2>/dev/null) || { warn "No user owns $home, skipped"; continue; }
+        log "Removing old agents for $user"
+        systemctl --user -M "$user@" stop "${LEGACY_UNITS[@]/%/.service}" egress-network.service 2>/dev/null || true
+        for name in "${LEGACY_UNITS[@]}"; do
+            rm -f "$home/.config/containers/systemd/$name.container" "$home/configuration/quadlets/$name.container"
+            rm -rf -- "${home:?}/configuration/image_builds/$name"
+            env_file="$home/configuration/secrets/${name%-agent}.env"
+            if [ -f "$env_file" ] && grep -qE "${LEGACY_ENV_MARKER[$name]}" "$env_file"; then
+                rm -f "$env_file"
+            fi
+        done
+        rm -f "$home/.config/containers/systemd/egress.network" "$home/configuration/quadlets/egress.network"
+        systemctl --user -M "$user@" daemon-reload 2>/dev/null || true
+        if [ -d "/run/user/$uid" ]; then
+            runuser -u "$user" -- env XDG_RUNTIME_DIR="/run/user/$uid" HOME="$home" sh -c \
+                'cd / && podman rmi -f localhost/dtrack-agent:latest localhost/opensearch-agent:latest localhost/cadvisor-agent:latest; podman network rm egress-network' \
+                >/dev/null 2>&1 || true
         fi
     done
-    echo "$value"
 }
 
-detect_podman_sock() {
-  local candidates=(
-    "${XDG_RUNTIME_DIR:-/run/user/$UID}/podman/podman.sock"
-    "/run/user/$UID/podman/podman.sock"
-    "/run/podman/podman.sock"
-  )
-  local s
-  for s in "${candidates[@]}"; do
-    [ -S "$s" ] && echo "$s" && return 0
-  done
-  return 1
+start_agents() {
+    log "Starting agents"
+    systemctl daemon-reload
+    "$CLI" inventory --no-reload
+    "$BIN_DIR/vector" validate --no-environment --config-dir "$VECTOR_CONF_DIR" >/dev/null \
+        || { "$BIN_DIR/vector" validate --no-environment --config-dir "$VECTOR_CONF_DIR" >&2; fail "Vector config is invalid"; }
+    systemctl enable --now "${TIMERS[@]}" >/dev/null
+    systemctl enable humlab-vector.service >/dev/null 2>&1
+    systemctl restart humlab-vector.service
+    sleep 5
+    systemctl is-active --quiet humlab-vector.service \
+        || { journalctl -u humlab-vector.service -n 30 --no-pager >&2; fail "humlab-vector did not start"; }
 }
 
-check_readable_file() {
-  local f="$1"
-  [ -f "$f" ] || fail "Required file not found: $f"
-  [ -r "$f" ] || fail "Required file not readable: $f"
+# --- Connection checks ---
+
+# http_code <url> <curl config>: status code of a GET. Credentials go in as a
+# curl config on stdin (-K -) so they never show in ps.
+http_code() {
+    local url=$1 config=$2
+    local code
+    code=$(printf '%s\n' "$config" | curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -K - "$url" 2>/dev/null) || true
+    echo "${code:-000}"
 }
 
-check_writable_dir() {
-  local d="$1"
-  mkdir -p "$d" 2>/dev/null || fail "Cannot create directory: $d"
-  [ -w "$d" ] || fail "Directory not writable: $d"
+check_connections() {
+    local host os_url prom_url dt_url code ok=1
+    host=$(env_get HOST_NAME "")
+    os_url=$(env_get OPENSEARCH_URL "")
+    prom_url=$(env_get PROMETHEUS_URL "")
+    dt_url=$(env_get DT_URL "")
+
+    echo
+    echo "=== Connection checks ==="
+    code=$(http_code "$os_url/" "user = \"ingest-$host:$(cat "$SECRETS_DIR/opensearch.password")\"")
+    case $code in
+        200) echo "  OpenSearch:       OK" ;;
+        401) echo "  OpenSearch:       wrong user or password (ingest-$host)"; ok=0 ;;
+        403) echo "  OpenSearch:       403, this server's IP is probably not on blackbox's allowlist"; ok=0 ;;
+        *)   echo "  OpenSearch:       no answer (HTTP $code) from $os_url"; ok=0 ;;
+    esac
+
+    # Prometheus only accepts POST here; 405 (or 404) means auth and allowlist passed.
+    code=$(http_code "$prom_url" "user = \"metrics-$host:$(cat "$SECRETS_DIR/prometheus.password")\"")
+    case $code in
+        404|405) echo "  Prometheus push:  OK" ;;
+        401) echo "  Prometheus push:  wrong user or password (metrics-$host)"; ok=0 ;;
+        403) echo "  Prometheus push:  403, this server's IP is probably not on blackbox's allowlist"; ok=0 ;;
+        *)   echo "  Prometheus push:  no answer (HTTP $code) from $prom_url"; ok=0 ;;
+    esac
+
+    # Polling an unknown upload token needs BOM_UPLOAD and returns 200.
+    code=$(http_code "$dt_url/api/v1/bom/token/00000000-0000-0000-0000-000000000000" \
+        "header = \"X-Api-Key: $(cat "$SECRETS_DIR/dtrack.apikey")\"")
+    case $code in
+        200) echo "  Dependency-Track: OK" ;;
+        401|403) echo "  Dependency-Track: API key rejected or missing BOM_UPLOAD permission"; ok=0 ;;
+        *)   echo "  Dependency-Track: no answer (HTTP $code) from $dt_url"; ok=0 ;;
+    esac
+
+    [ $ok = 1 ] || warn "Some checks failed. The agents buffer to disk and retry, so fix the cause and they catch up."
 }
 
-# --- Preflight checks ---
-log "Running preflight checks"
+# --- Commands ---
 
-# Basic environment
-[ -n "${HOME:-}" ] || fail "\$HOME is not set"
-check_writable_dir "$HOME"
+do_install() {
+    preflight install
+    install_binaries
+    create_users
+    configure
+    configure_docker_logs
+    install_files
+    register_services
+    remove_legacy_agents
+    start_agents
+    check_connections
+    echo
+    log "Done. 'sudo ./install.sh status' shows the agents; the first SBOM scan runs within a day"
+    log "(start it now with: sudo systemctl start humlab-sbom.service)."
+}
 
-# Required commands
-for c in bash cp ln rm mkdir grep cut tr basename dirname sed hostname; do
-  have_cmd "$c" || fail "Missing required command: $c"
-done
+do_services() {
+    preflight services
+    [ -x "$CLI" ] || fail "Agents are not installed yet; run: sudo $0"
+    "$CLI" services
+    "$CLI" inventory
+}
 
-have_cmd podman    || fail "podman is not installed or not in PATH"
-have_cmd systemctl || fail "systemctl is not installed or not in PATH"
+do_status() {
+    preflight status
+    systemctl --no-pager list-units "${UNITS[@]}" || true
+    echo
+    systemctl --no-pager list-timers "${TIMERS[@]}" || true
+    echo
+    [ -x "$CLI" ] && "$CLI" list
+    echo
+    echo "Warnings from the last hour:"
+    journalctl --no-pager -p warning --since -1h -n 20 -u humlab-vector.service -u humlab-inventory.service -u humlab-sbom.service || true
+}
 
-# Python requirement (host)
-have_cmd python3 || fail "python3 is required but not installed"
-python3 -c 'import sys; assert sys.version_info >= (3,8), sys.version' \
-  || fail "python3 >= 3.8 is required"
+do_uninstall() {
+    preflight uninstall
+    ask_yes "Stop and remove the Humlab agents?" n || exit 0
+    systemctl disable --now "${UNITS[@]}" 2>/dev/null || true
+    local u
+    for u in "${UNITS[@]}"; do rm -f "$UNIT_DIR/$u"; done
+    rm -f "$DOCKER_DROPIN"
+    rmdir "$(dirname "$DOCKER_DROPIN")" 2>/dev/null || true
+    systemctl daemon-reload
+    rm -f "$CLI"
+    rm -rf -- "$LIB_DIR"
+    log "Removed. Kept $CONF_DIR (settings, secrets, service registry) and /var/lib/humlab-vector (buffers)."
+    log "Delete those and the users humlab-vector and humlab-sbom by hand if you don't need them."
+}
 
-# Podman usability (rootless)
-podman info >/dev/null 2>&1 || fail "podman is installed but not usable for this user (podman info failed)"
-
-# systemd user session availability
-if ! systemctl --user status >/dev/null 2>&1; then
-  fail "systemd user instance not available (systemctl --user failed).
-You may need an active user session or to enable lingering: sudo loginctl enable-linger $USER"
-fi
-
-# Quadlet directory expectation (rootless quadlets)
-check_writable_dir "$QUADLET_SYSTEMD_DIR"
-
-# Locate source tree (requires SCRIPT_DIR already set)
-check_readable_file "$SCRIPT_DIR/env/dtrack.env"
-check_readable_file "$SCRIPT_DIR/env/opensearch.env"
-check_readable_file "$SCRIPT_DIR/env/cadvisor.env"
-
-check_readable_file "$SCRIPT_DIR/image_builds/dtrack/Containerfile"
-check_readable_file "$SCRIPT_DIR/image_builds/dtrack/agent.py"
-check_readable_file "$SCRIPT_DIR/image_builds/dtrack/build-dtrack-agent.sh"
-
-check_readable_file "$SCRIPT_DIR/image_builds/opensearch/Containerfile"
-check_readable_file "$SCRIPT_DIR/image_builds/opensearch/agent.py"
-
-check_readable_file "$SCRIPT_DIR/image_builds/cadvisor/Containerfile"
-
-check_readable_file "$SCRIPT_DIR/quadlets/dtrack-agent.container"
-check_readable_file "$SCRIPT_DIR/quadlets/opensearch-agent.container"
-check_readable_file "$SCRIPT_DIR/quadlets/cadvisor-agent.container"
-check_readable_file "$SCRIPT_DIR/quadlets/egress.network"
-
-log "Preflight checks passed"
-
-# --- Source templates ---
-TEMPLATE_ENV_DTRACK="$SCRIPT_DIR/env/dtrack.env"
-TEMPLATE_ENV_OPENSEARCH="$SCRIPT_DIR/env/opensearch.env"
-TEMPLATE_ENV_CADVISOR="$SCRIPT_DIR/env/cadvisor.env"
-
-# --- Prepare destination directories ---
-log "Creating destination directories under $DEST_BASE"
-mkdir -p \
-  "$DEST_IMAGE_BUILD_DTRACK" \
-  "$DEST_IMAGE_BUILD_OPENSEARCH" \
-  "$DEST_IMAGE_BUILD_CADVISOR" \
-  "$DEST_QUADLETS" \
-  "$DEST_SECRETS" \
-  "$QUADLET_SYSTEMD_DIR"
-
-# --- Copy dtrack files ---
-log "Copying dtrack-agent files"
-cp "$SCRIPT_DIR/image_builds/dtrack/Containerfile" "$DEST_IMAGE_BUILD_DTRACK/Containerfile"
-cp "$SCRIPT_DIR/image_builds/dtrack/agent.py" "$DEST_IMAGE_BUILD_DTRACK/agent.py"
-cp "$SCRIPT_DIR/image_builds/dtrack/build-dtrack-agent.sh" "$DEST_IMAGE_BUILD_DTRACK/build-dtrack-agent.sh"
-
-# --- Copy opensearch files ---
-log "Copying opensearch-agent files"
-cp "$SCRIPT_DIR/image_builds/opensearch/Containerfile" "$DEST_IMAGE_BUILD_OPENSEARCH/Containerfile"
-cp "$SCRIPT_DIR/image_builds/opensearch/agent.py" "$DEST_IMAGE_BUILD_OPENSEARCH/agent.py"
-
-# --- Copy cadvisor files ---
-log "Copying cadvisor-agent files"
-cp "$SCRIPT_DIR/image_builds/cadvisor/Containerfile" "$DEST_IMAGE_BUILD_CADVISOR/Containerfile"
-
-# --- Copy quadlet files ---
-log "Copying quadlet files"
-cp "$SCRIPT_DIR/quadlets/dtrack-agent.container" "$DEST_QUADLETS/dtrack-agent.container"
-cp "$SCRIPT_DIR/quadlets/opensearch-agent.container" "$DEST_QUADLETS/opensearch-agent.container"
-cp "$SCRIPT_DIR/quadlets/cadvisor-agent.container" "$DEST_QUADLETS/cadvisor-agent.container"
-cp "$SCRIPT_DIR/quadlets/egress.network" "$DEST_QUADLETS/egress.network"
-
-log "Copying env templates"
-cp "$TEMPLATE_ENV_DTRACK" "$DEST_ENV_FILE_DTRACK"
-cp "$TEMPLATE_ENV_OPENSEARCH" "$DEST_ENV_FILE_OPENSEARCH"
-cp "$TEMPLATE_ENV_CADVISOR" "$DEST_ENV_FILE_CADVISOR"
-
-# --- Default Values ---
-DT_URL_DEFAULT=$(grep -E '^DT_URL=' "$DEST_ENV_FILE_DTRACK" | cut -d= -f2- || true)
-DT_URL_DEFAULT=${DT_URL_DEFAULT:-"https://api.dtrack.humlab.umu.se"}
-
-SCAN_INTERVAL_DEFAULT=$(grep -E '^SCAN_INTERVAL_SECONDS=' "$DEST_ENV_FILE_DTRACK" | cut -d= -f2- || true)
-SCAN_INTERVAL_DEFAULT=${SCAN_INTERVAL_DEFAULT:-"86400"}
-
-DT_PROJECT_VERSION_DEFAULT=$(grep -E '^DT_PROJECT_VERSION=' "$DEST_ENV_FILE_DTRACK" | cut -d= -f2- || true)
-DT_PROJECT_VERSION_DEFAULT=${DT_PROJECT_VERSION_DEFAULT:-"v0.0.0"}
-
-DT_PROJECT_NAME_DEFAULT="$(basename "$(dirname "$(pwd)")")"
-
-if [ -r /etc/hostname ]; then
-    SERVER_HOSTNAME_DEFAULT="$(tr -d '\n' < /etc/hostname)"
-else
-    SERVER_HOSTNAME_DEFAULT="$(hostname || echo "")"
-fi
-
-OPENSEARCH_URL_DEFAULT=$(grep -E '^OPENSEARCH_URL' "$DEST_ENV_FILE_OPENSEARCH" | cut -d= -f2- | tr -d ' "' || true)
-OPENSEARCH_URL_DEFAULT=${OPENSEARCH_URL_DEFAULT:-"http://opensearch:9200"}
-
-AGENT_MODE_DEFAULT=$(grep -E '^AGENT_MODE' "$DEST_ENV_FILE_OPENSEARCH" | cut -d= -f2- | tr -d ' "' || true)
-AGENT_MODE_DEFAULT=${AGENT_MODE_DEFAULT:-"local"}
-
-NODE_NAME_DEFAULT=$(grep -E '^NODE_NAME' "$DEST_ENV_FILE_OPENSEARCH" | cut -d= -f2- | tr -d ' "' || true)
-NODE_NAME_DEFAULT=${NODE_NAME_DEFAULT:-"$SERVER_HOSTNAME_DEFAULT"}
-
-# --- Prompts for dtrack-agent ---
-echo
-echo "=== dtrack-agent configuration ==="
-echo
-
-DT_URL="$(prompt_with_default "DT_URL" "$DT_URL_DEFAULT")"
-DT_API_KEY="$(prompt_required_secret "DT_API_KEY")"
-DT_PROJECT_NAME="$(prompt_with_default "DT_PROJECT_NAME" "$DT_PROJECT_NAME_DEFAULT")"
-SCAN_INTERVAL_SECONDS="$(prompt_with_default "SCAN_INTERVAL_SECONDS" "$SCAN_INTERVAL_DEFAULT")"
-SERVER_HOSTNAME="$(prompt_with_default "SERVER_HOSTNAME" "$SERVER_HOSTNAME_DEFAULT")"
-DT_PROJECT_VERSION="$DT_PROJECT_VERSION_DEFAULT"
-
-echo
-echo "Writing dtrack configuration to: $DEST_ENV_FILE_DTRACK"
-cat >"$DEST_ENV_FILE_DTRACK" <<EOF
-DT_URL=$DT_URL
-DT_API_KEY=$DT_API_KEY
-DT_PROJECT_NAME=$DT_PROJECT_NAME
-DT_PROJECT_VERSION=$DT_PROJECT_VERSION
-SCAN_INTERVAL_SECONDS=$SCAN_INTERVAL_SECONDS
-SERVER_HOSTNAME=$SERVER_HOSTNAME
-EOF
-
-chmod 600 "$DEST_ENV_FILE_DTRACK" || true
-
-# --- Prompts for opensearch-agent ---
-echo
-echo "=== opensearch-agent configuration ==="
-echo
-
-OPENSEARCH_URL="$(prompt_with_default "OPENSEARCH_URL" "$OPENSEARCH_URL_DEFAULT")"
-AGENT_MODE="$(prompt_with_default "AGENT_MODE (opensearch/local)" "$AGENT_MODE_DEFAULT")"
-NODE_NAME="$(prompt_with_default "NODE_NAME" "$NODE_NAME_DEFAULT")"
-
-case "$AGENT_MODE" in
-  local|opensearch) ;;
-  *) fail "AGENT_MODE must be 'local' or 'opensearch' (got: $AGENT_MODE)" ;;
+case "${1:-install}" in
+    install)   do_install ;;
+    services)  do_services ;;
+    status)    do_status ;;
+    uninstall) do_uninstall ;;
+    *) sed -n '3,9p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
-
-echo
-echo "Writing opensearch configuration to: $DEST_ENV_FILE_OPENSEARCH"
-cat >"$DEST_ENV_FILE_OPENSEARCH" <<EOF
-PODMAN_SOCKET_PATH=/run/podman/podman.sock
-OPENSEARCH_URL=$OPENSEARCH_URL
-OPENSEARCH_INDEX_PREFIX=podman-logs
-NODE_NAME=$NODE_NAME
-DISCOVERY_INTERVAL_SECONDS=3600
-LOG_LEVEL=INFO
-AGENT_MODE=$AGENT_MODE
-EOF
-
-chmod 600 "$DEST_ENV_FILE_OPENSEARCH" || true
-
-# --- Symlinking Quadlets ---
-log "Setting up quadlet symlinks in $QUADLET_SYSTEMD_DIR"
-
-link_quadlet() {
-    local filename="$1"
-    local target_file="$DEST_QUADLETS/$filename"
-    local link_path="$QUADLET_SYSTEMD_DIR/$filename"
-
-    # Remove existing (even if broken)
-    if [ -L "$link_path" ] || [ -e "$link_path" ]; then
-        rm -f "$link_path"
-    fi
-
-    ln -s "$target_file" "$link_path"
-    log "Symlinked: $link_path -> $target_file"
-}
-
-link_quadlet "dtrack-agent.container"
-link_quadlet "opensearch-agent.container"
-link_quadlet "cadvisor-agent.container"
-link_quadlet "egress.network"
-
-# --- Build the container images ---
-log "Building dtrack-agent container image"
-if cd "$DEST_IMAGE_BUILD_DTRACK" && bash build-dtrack-agent.sh; then
-    log "dtrack-agent image built successfully"
-else
-    fail "Failed to build dtrack-agent image"
-fi
-
-log "Building opensearch-agent container image"
-if cd "$DEST_IMAGE_BUILD_OPENSEARCH" && podman build --no-cache -t localhost/opensearch-agent:latest .; then
-    log "opensearch-agent image built successfully"
-else
-    fail "Failed to build opensearch-agent image"
-fi
-
-log "Building cadvisor-agent container image"
-if cd "$DEST_IMAGE_BUILD_CADVISOR" && podman build --no-cache -t localhost/cadvisor-agent:latest .; then
-    log "cadvisor-agent image built successfully"
-else
-    fail "Failed to build cadvisor-agent image"
-fi
-
-# --- Enable Podman socket ---
-log "Enabling Podman socket"
-systemctl --user enable --now podman.socket || fail "Failed to enable/start podman.socket"
-systemctl --user is-active --quiet podman.socket || fail "podman.socket is not active after enabling"
-
-PODMAN_SOCK="$(detect_podman_sock)" || fail "Could not find Podman socket after enabling podman.socket"
-
-# Update opensearch env file safely
-sed -i "s|^PODMAN_SOCKET_PATH=.*$|PODMAN_SOCKET_PATH=$PODMAN_SOCK|" "$DEST_ENV_FILE_OPENSEARCH"
-
-# --- Systemd Reload ---
-echo
-log "Reloading systemd user units"
-
-if systemctl --user daemon-reload; then
-    log "Validating quadlet unit generation"
-    for unit in egress-network.service dtrack-agent.service opensearch-agent.service cadvisor-agent.service; do
-        # list-unit-files is less sensitive to inactive/failed units than status
-        systemctl --user list-unit-files "$unit" >/dev/null 2>&1 \
-            || fail "Quadlet did not generate expected unit: $unit"
-    done
-
-    log "Starting egress-network.service"
-    systemctl --user start egress-network.service || log "WARNING: Could not start egress-network.service"
-
-    log "Starting dtrack-agent.service"
-    systemctl --user start --now dtrack-agent.service || log "WARNING: Could not start dtrack-agent.service"
-
-    log "Starting opensearch-agent.service"
-    systemctl --user start --now opensearch-agent.service || log "WARNING: Could not start opensearch-agent.service"
-
-    log "Starting cadvisor-agent.service"
-    systemctl --user start --now cadvisor-agent.service || log "WARNING: Could not start cadvisor-agent.service"
-else
-    log "WARNING: systemctl --user daemon-reload failed"
-fi
-
-echo
-echo "Installation complete."
-echo "Quadlets installed in: $DEST_QUADLETS"
-echo "Symlinks created in:   $QUADLET_SYSTEMD_DIR"
-echo "Environment files:"
-echo "  - $DEST_ENV_FILE_DTRACK"
-echo "  - $DEST_ENV_FILE_OPENSEARCH"
-echo "  - $DEST_ENV_FILE_CADVISOR"

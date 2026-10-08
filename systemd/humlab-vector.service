@@ -1,0 +1,51 @@
+[Unit]
+Description=Humlab telemetry agent (logs to OpenSearch, metrics to Prometheus)
+Documentation=https://github.com/humlab/humlab-service-agents
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=humlab-vector
+Group=humlab-vector
+# Read every journal (system and all users) without any other privilege.
+SupplementaryGroups=systemd-journal
+# Loads vector.yaml, plus docker-logs.yaml on hosts that need it.
+ExecStart=/usr/local/lib/humlab-agents/bin/vector --config-dir /etc/humlab-agents/vector
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+
+# Passwords are root-only files, handed to this service in /run/credentials/.
+LoadCredential=opensearch_password:/etc/humlab-agents/secrets/opensearch.password
+LoadCredential=prometheus_password:/etc/humlab-agents/secrets/prometheus.password
+StateDirectory=humlab-vector
+
+# Stay out of the way of the services being monitored.
+Nice=5
+CPUWeight=20
+MemoryHigh=384M
+MemoryMax=512M
+
+# Hardening: read-only view of the system, no privileges.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+# read-only rather than yes: filesystem metrics need to stat /home.
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

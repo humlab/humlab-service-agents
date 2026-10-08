@@ -1,0 +1,184 @@
+# Humlab telemetry agent, one per server.
+#
+#   journald (container stdout/stderr + host logs) -> OpenSearch logs-container-* / logs-syslog-*
+#   host_metrics (host + per-container cgroups)    -> Prometheus remote write
+#
+# install.sh renders this template to /etc/humlab-agents/vector/vector.yaml,
+# filling the @...@ placeholders with values from /etc/humlab-agents/agents.env (Vector no
+# longer interpolates environment variables by default). Passwords stay out of
+# the file: they come from systemd credentials (LoadCredential= in
+# humlab-vector.service). Field and index rules follow the
+# blackbox client guide: monthly logs-<source>-YYYY.MM indices, ECS field names,
+# a `host` label on every metric.
+
+data_dir: "@DATA_DIR@"
+
+secret:
+  creds:
+    type: directory
+    path: "@CREDENTIALS_DIR@"
+    remove_trailing_whitespace: true
+
+enrichment_tables:
+  # container id -> service, written every 2 minutes by `humlab-agents inventory`,
+  # which reloads Vector when it changes.
+  inventory:
+    type: file
+    file:
+      path: "@INVENTORY@"
+      encoding:
+        type: csv
+    schema:
+      container_id: string
+      container_name: string
+      service: string
+      image: string
+
+sources:
+  # Reads the system journal and every user's journal (the service runs in the
+  # systemd-journal group). Podman and Docker's journald log driver write
+  # CONTAINER_ID_FULL / CONTAINER_NAME on each container line.
+  logs_src_journald:
+    type: journald
+    since_now: true
+    exclude_units: [humlab-vector.service]
+
+  metrics_src_host:
+    type: host_metrics
+    scrape_interval_secs: 30
+    collectors: [cpu, memory, disk, filesystem, load, network, host, cgroups]
+    disk:
+      devices:
+        excludes: ["loop*", "ram*", "sr*"]
+    filesystem:
+      filesystems:
+        excludes: [overlay, tmpfs, devtmpfs, devpts, squashfs, nsfs, proc, sysfs, cgroup2, autofs, ramfs,
+                   fusectl, "fuse.*", tracefs, debugfs, securityfs, pstore, bpf, configfs,
+                   efivarfs, mqueue, hugetlbfs, binfmt_misc]
+      mountpoints:
+        excludes: ["/run/*", "/snap/*", "/var/lib/docker/*", "*/containers/storage/*"]
+    network:
+      devices:
+        excludes: [lo, "veth*", "podman*", "docker*", "br-*", "cni*", "tap*", "virbr*"]
+
+  metrics_src_agent:
+    type: internal_metrics
+    scrape_interval_secs: 30
+
+transforms:
+  logs_shape:
+    type: remap
+    inputs: ["logs_src_*"]
+    drop_on_abort: true
+    source: |
+      out = {"@timestamp": .timestamp, "host": {"name": "@HOST_NAME@"}}
+      cid = to_string(.CONTAINER_ID_FULL) ?? ""
+      cname = to_string(.CONTAINER_NAME) ?? ""
+      # Podman and Docker log stderr at priority 3, stdout at 6.
+      stream = if .PRIORITY == "3" { "stderr" } else { "stdout" }
+      image = ""
+      if .source_type == "docker_logs" {
+        cid = to_string(.container_id) ?? ""
+        cname = to_string(.container_name) ?? ""
+        stream = to_string(.stream) ?? "stdout"
+        image = to_string(.image) ?? ""
+      }
+
+      if cid != "" {
+        service = cname
+        row, err = get_enrichment_table_record("inventory", {"container_id": cid})
+        if err == null {
+          service = string!(row.service)
+          if image == "" { image = string!(row.image) }
+        }
+        out.service = {"name": service}
+        out.container = {"id": cid, "name": cname}
+        if image != "" { out.container.image = {"name": image} }
+        out.stream = stream
+        out.index_source = "container"
+      } else {
+        # Host log: keep warnings and worse, plus everything from HOST_LOG_UNITS.
+        prio = to_int(.PRIORITY) ?? 6
+        unit = to_string(._SYSTEMD_UNIT) ?? ""
+        listed = unit != "" && includes(split("@HOST_LOG_UNITS@", " "), unit)
+        if prio > @HOST_LOG_MAX_PRIORITY@ && !listed { abort }
+        level = "info"
+        if prio <= 3 { level = "error" } else if prio == 4 { level = "warn" } else if prio == 7 { level = "debug" }
+        out.service = {"name": to_string(.SYSLOG_IDENTIFIER) ?? to_string(._COMM) ?? "unknown"}
+        out.log = {"level": level}
+        out.process = {"name": to_string(._COMM) ?? "", "pid": to_int(._PID) ?? 0}
+        if unit != "" { out.systemd = {"unit": unit} }
+        user_unit = to_string(._SYSTEMD_USER_UNIT) ?? ""
+        if user_unit != "" { out.systemd.user_unit = user_unit }
+        out.index_source = "syslog"
+      }
+      out.message = replace(to_string(.message) ?? encode_json(.message), r'\r?\n$', "")
+      . = out
+
+  metrics_shape:
+    type: remap
+    inputs: ["metrics_src_*"]
+    drop_on_abort: true
+    source: |
+      .tags.host = "@HOST_NAME@"
+      if .tags.collector == "cgroups" {
+        # Keep one cgroup per container (path ends in its id) and name it by
+        # service and container. Everything else in the cgroup tree is dropped.
+        if !includes(["cgroup_cpu_usage_seconds_total", "cgroup_cpu_user_seconds_total",
+                      "cgroup_cpu_system_seconds_total", "cgroup_memory_current_bytes",
+                      "cgroup_memory_anon_bytes", "cgroup_memory_file_bytes"], .name) { abort }
+        m, err = parse_regex(.tags.cgroup, r'(?:libpod-(?:payload-)?|docker-)(?P<id>[0-9a-f]{64})(?:\.scope)?$')
+        if err != null { abort }
+        row, err = get_enrichment_table_record("inventory", {"container_id": m.id})
+        if err == null {
+          .tags.service = string!(row.service)
+          .tags.container = string!(row.container_name)
+        } else {
+          .tags.service = "unregistered"
+          .tags.container = slice!(m.id, 0, 12)
+        }
+        del(.tags.cgroup)
+      }
+
+sinks:
+  opensearch:
+    type: elasticsearch
+    inputs: [logs_shape]
+    endpoints: ["@OPENSEARCH_URL@"]
+    api_version: v8
+    mode: bulk
+    bulk:
+      index: "logs-{{ index_source }}-%Y.%m"
+      action: index
+    auth:
+      strategy: basic
+      user: "@OPENSEARCH_USER@"
+      password: "SECRET[creds.opensearch_password]"
+    compression: gzip
+    encoding:
+      except_fields: [index_source]
+    batch:
+      max_events: 2000
+      max_bytes: 8000000
+      timeout_secs: 5
+    request_retry_partial: true
+    buffer:
+      type: disk
+      max_size: 1073741824
+
+  prometheus:
+    type: prometheus_remote_write
+    inputs: [metrics_shape]
+    endpoint: "@PROMETHEUS_URL@"
+    auth:
+      strategy: basic
+      user: "@PROMETHEUS_USER@"
+      password: "SECRET[creds.prometheus_password]"
+    # nginx exposes only POST /api/v1/write; there is nothing to health-check.
+    healthcheck:
+      enabled: false
+    batch:
+      timeout_secs: 10
+    buffer:
+      type: disk
+      max_size: 268435488

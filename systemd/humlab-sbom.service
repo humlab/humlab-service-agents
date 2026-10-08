@@ -1,0 +1,17 @@
+[Unit]
+Description=Humlab agents: scan container images and upload SBOMs to Dependency-Track
+Documentation=https://github.com/humlab/humlab-service-agents
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Root orchestrates; images are saved and scanned as their owner (rootless
+# Podman) or as humlab-sbom (Docker, rootful Podman). See humlab_agents.py.
+EnvironmentFile=/etc/humlab-agents/agents.env
+ExecStart=/usr/local/bin/humlab-agents sbom
+TimeoutStartSec=4h
+Nice=15
+IOSchedulingClass=idle
+# No PrivateTmp: rootless Podman joins the owner's existing mount namespace
+# and would not see a private /var/tmp. Temp dirs are 0700, per scan.

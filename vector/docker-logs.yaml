@@ -1,0 +1,9 @@
+# Docker container logs through the Docker API. Installed only on hosts where
+# Docker logs to json-file/local rather than journald, and only if the admin
+# accepts adding humlab-vector to the docker group (root-equivalent).
+# logs_shape picks this up through its "logs_src_*" input.
+
+sources:
+  logs_src_docker:
+    type: docker_logs
+    docker_host: unix:///var/run/docker.sock

@@ -1,0 +1,13 @@
+[Unit]
+Description=Humlab agents: map running containers to services
+Documentation=https://github.com/humlab/humlab-service-agents
+
+[Service]
+Type=oneshot
+# Root, so it can list each owner's containers (it switches to that user for
+# rootless Podman). Writes /var/lib/humlab-agents/inventory.csv and reloads
+# humlab-vector when it changes.
+ExecStart=/usr/local/bin/humlab-agents inventory
+Nice=10
+StateDirectory=humlab-agents
+StateDirectoryMode=0755
