@@ -456,6 +456,8 @@ do_install() {
 do_services() {
     preflight services
     [ -x "$CLI" ] || fail "Agents are not installed yet; run: sudo $0"
+    # Use this checkout's discovery code, not the copy from the last install.
+    install -m 755 "$SCRIPT_DIR/agent/humlab_agents.py" "$LIB_DIR/humlab_agents.py"
     "$CLI" services
     "$CLI" inventory
 }
