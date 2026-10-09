@@ -536,13 +536,19 @@ do_uninstall() {
 
 # --- Menu (installed servers) ---
 
+# The registry commands run this checkout's agent code, like the menu itself:
+# the installed copy may be older until the next update.
+checkout_cli() {
+    python3 "$SCRIPT_DIR/agent/humlab_agents.py" "$@"
+}
+
 find_services() {
-    "$CLI" services
+    checkout_cli services
     "$CLI" inventory
 }
 
 edit_services() {
-    "$CLI" edit
+    checkout_cli edit
     "$CLI" inventory
 }
 
@@ -629,6 +635,10 @@ do_menu() {
     [ -t 0 ] || fail "The menu needs a terminal. Commands: $0 {install|update|services|enroll|status|uninstall}"
     local choice
     trap ':' INT
+    if checkout_differs; then
+        echo "This checkout differs from the installed agents."
+        ask_yes "Update them now?" y && run_action do_update
+    fi
     while :; do
         menu_header
         read -r -p "Choice: " choice || { echo; return 0; }
