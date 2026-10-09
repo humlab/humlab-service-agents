@@ -81,10 +81,36 @@ The installer:
 5. Starts the agents and checks that OpenSearch, Prometheus and
    Dependency-Track accept the credentials from this server.
 
-Re-run `sudo ./install.sh` to update. To get new credentials, re-run it with a new
-key; this works from the address the server enrolled from. A server that has
-moved to a new address needs a key made with `key new --server <name>`. It needs a systemd of version 247 or later,
-Python 3.9 or later, and Podman or Docker.
+It needs a systemd of version 247 or later, Python 3.9 or later, and Podman or
+Docker.
+
+## Later changes: the menu
+
+Once the agents are installed, `sudo ./install.sh` opens a menu instead of the
+wizard:
+
+```
+  [A] Agent status and recent warnings
+  [L] List services and their running containers
+  [F] Find new services
+  [R] Remove a service
+  [E] Enroll with a new key
+  [C] Check the connections to blackbox
+  [S] Scan images and upload SBOMs now
+  [U] Update the agents from this checkout (after git pull)
+  [W] Run the whole setup wizard again
+  [X] Uninstall
+  [Q] Quit
+```
+
+The menu says when the checkout differs from what is installed. To update:
+`git pull`, then `sudo ./install.sh` and **U**, or `sudo ./install.sh update`
+without the menu. Update asks no questions; it keeps the settings, credentials
+and services.
+
+New credentials (**E**) need a new key and work from the address the server
+enrolled from. A server that has moved to a new address needs a key made with
+`key new --server <name>`.
 
 ## Services
 
@@ -143,7 +169,9 @@ runtime directory. It warns about a user whose running containers it cannot
 list, usually because lingering is off. Then it lists the running containers
 that no registered service covers, so you can add their directories by hand.
 
-Run `sudo ./install.sh services` to look again after deploying something new.
+After deploying something new, look again with **F** in the menu. It offers only
+compose projects with running containers; the others are counted and can be
+listed, or added by path.
 Containers that belong to no registered service are still logged and measured,
 under their container name (logs) or `service="unregistered"` (metrics), and get
 no SBOM.
@@ -171,15 +199,17 @@ names change, e.g. one per user session) are grouped by image instead:
 ## Operating it
 
 ```bash
+sudo ./install.sh                           # the menu
 sudo ./install.sh status                    # units, timers, services, recent warnings
 sudo humlab-agents list                     # services and their containers
+sudo humlab-agents remove <service>         # unregister a service
 sudo systemctl start humlab-sbom.service    # scan now
 journalctl -u humlab-vector -f              # agent log
 ```
 
 | File | Contents |
 |---|---|
-| `/etc/humlab-agents/agents.env` | Server name, endpoints, host-log filter. Re-run the installer after editing. |
+| `/etc/humlab-agents/agents.env` | Server name, endpoints, host-log filter. Run `sudo ./install.sh update` after editing. |
 | `/etc/humlab-agents/services.conf` | Service registry |
 | `/etc/humlab-agents/secrets/` | Passwords and API key from enrollment (root only) |
 | `/etc/humlab-agents/vector/` | Rendered Vector config |
@@ -192,7 +222,7 @@ The journal position is saved, so a restart of the agent loses nothing either.
 ## Repository layout
 
 ```
-install.sh              installer (install, services, status, uninstall)
+install.sh              installer: setup wizard, then a menu (also install, update, services, enroll, status, uninstall)
 agent/humlab_agents.py  service registry, inventory, SBOM scans
 vector/vector.yaml      Vector config template (@...@ filled in by install.sh)
 vector/docker-logs.yaml Docker API log source, only when chosen

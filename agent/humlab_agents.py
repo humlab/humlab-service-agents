@@ -74,12 +74,14 @@ class Service:
     def compose_project(self) -> str:
         return self.project or compose_project_name(self.path)
 
-    def matches(self, labels: dict) -> bool:
-        """True if a compose container (by its labels) belongs to this service."""
+    def matches(self, labels: dict, name_fallback: bool = True) -> bool:
+        """True if a compose container (by its labels) belongs to this service:
+        by its working directory while that exists, otherwise (if name_fallback)
+        by compose project name. Many projects share a name such as "docker"."""
         wd = labels.get(WORKING_DIR_LABEL)
-        if wd and same_path(wd, self.path):
-            return True
-        return labels.get("com.docker.compose.project") == self.compose_project
+        if wd and os.path.isdir(wd):
+            return same_path(wd, self.path)
+        return name_fallback and labels.get("com.docker.compose.project") == self.compose_project
 
 
 def compose_project_name(path: str) -> str:
@@ -127,8 +129,12 @@ def save_registry(services: list) -> None:
 
 # ---------------------------------------------------------------- runtimes
 
-def run_as(owner: str, argv: list, env: dict = None, timeout: int = 120) -> subprocess.CompletedProcess:
+def run_as(owner: str, argv: list, env: dict = None, timeout: int = 120,
+           user_session: bool = True) -> subprocess.CompletedProcess:
     """Run argv as owner, with the environment a rootless Podman expects.
+
+    user_session=False is for commands that need no runtime directory
+    (/run/user/<uid>), such as syft as SCAN_USER, a system user without lingering.
 
     Uses setuid/setgid directly rather than runuser, so frequent calls don't
     open a PAM session (and an auth.log line) each time.
@@ -137,7 +143,7 @@ def run_as(owner: str, argv: list, env: dict = None, timeout: int = 120) -> subp
     full_env = {"PATH": SAFE_PATH, "LANG": "C.UTF-8", "HOME": pw.pw_dir,
                 "USER": owner, "LOGNAME": owner}
     kwargs = {}
-    if pw.pw_uid != 0:
+    if pw.pw_uid != 0 and user_session:
         runtime_dir = f"/run/user/{pw.pw_uid}"
         if not os.path.isdir(runtime_dir):
             raise RuntimeError(f"{runtime_dir} does not exist; enable lingering: loginctl enable-linger {owner}")
@@ -195,8 +201,13 @@ def attach_containers(services: list, listed: dict = None) -> None:
         projects = systemd_projects(owner, containers) if runtime == "podman" and quadlet else {}
         home = pwd.getpwnam(owner).pw_dir if quadlet else ""
         whole_user = next((s for s in quadlet if same_path(s.path, home)), None)
+        # A service whose directory has running containers owns just those; the
+        # project-name fallback is for services registered by name.
+        live_dirs = {os.path.realpath(wd) for c in containers
+                     if (wd := c["labels"].get(WORKING_DIR_LABEL)) and os.path.isdir(wd)}
         for c in containers:
-            owner_svc = next((s for s in compose if s.matches(c["labels"])), None)
+            owner_svc = next((s for s in compose
+                              if s.matches(c["labels"], os.path.realpath(s.path) not in live_dirs)), None)
             project = projects.get(c["id"], "")
             if owner_svc is None and project:
                 owner_svc = max((s for s in quadlet if is_under(project, s.path)),
@@ -402,7 +413,7 @@ def scan_image(svc: Service, container: dict) -> dict:
                      [str(BIN_DIR / "syft"), "-q", f"docker-archive:{archive}", "-o", "cyclonedx-json",
                       "--source-name", name, "--source-version", version],
                      env={"SYFT_CHECK_FOR_APP_UPDATE": "false", "XDG_CACHE_HOME": tmp, "TMPDIR": tmp},
-                     timeout=3600).stdout
+                     timeout=3600, user_session=False).stdout
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     bom = json.loads(out)
@@ -776,18 +787,24 @@ def cmd_services(args) -> int:
                                 project if project != compose_project_name(path) else ""))
         taken.add(name)
 
+    # Only running projects are offered; a home directory can hold dozens of
+    # checkouts that are never started. Those can be added by path below.
+    idle = []
     for d in candidates:
         info, how = find_running_project(d, running, services)
-        if info:
-            state = f"running under {info.runtime} as {info.owner}, matched by {how}"
-        else:
-            state = "no running containers found"
-        print(f"Compose project {d} ({state})")
+        if not info:
+            idle.append(d)
+            continue
+        print(f"Compose project {d} (running under {info.runtime} as {info.owner}, matched by {how})")
         if auto:
-            if info:
-                add_compose(d, info, False)
-        elif ask_yes("  Monitor it?", bool(info)):
+            add_compose(d, info, False)
+        elif ask_yes("  Monitor it?", True):
             add_compose(d, info, True)
+    if idle and not auto:
+        print(f"\n{len(idle)} compose directories have no running containers and are not offered.")
+        if ask_yes("  List them?", False):
+            for d in idle:
+                print(f"    {d}")
 
     # Everything the inventory would leave out, so it can be added by hand.
     uncovered = uncovered_containers(services, listed)
@@ -828,6 +845,18 @@ def cmd_services(args) -> int:
     return 0
 
 
+def cmd_remove(args) -> int:
+    services = load_registry()
+    unknown = sorted(set(args.service) - {s.name for s in services})
+    if unknown:
+        log(f"ERROR: not registered: {', '.join(unknown)}")
+        return 1
+    save_registry([s for s in services if s.name not in args.service])
+    print(f"Removed {', '.join(args.service)}. Its containers are now logged under their own names; "
+          f"its Dependency-Track project is kept.")
+    return 0
+
+
 def cmd_list(args) -> int:
     services = load_registry()
     attach_containers(services)
@@ -862,6 +891,9 @@ def main() -> int:
     p.add_argument("--yes", action="store_true", help="register quadlet users, systemd-started projects and running compose projects without asking")
     p.set_defaults(func=cmd_services)
     sub.add_parser("list", help="show registered services").set_defaults(func=cmd_list)
+    p = sub.add_parser("remove", help="unregister services")
+    p.add_argument("service", nargs="+")
+    p.set_defaults(func=cmd_remove)
     p = sub.add_parser("inventory", help="write the container-to-service table for Vector")
     p.add_argument("--no-reload", action="store_true", help="don't reload Vector afterwards")
     p.set_defaults(func=cmd_inventory)

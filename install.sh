@@ -2,8 +2,11 @@
 #
 # Install the Humlab telemetry agents on one server. Run as root:
 #
-#   sudo ./install.sh             Install or update. Safe to re-run; keeps earlier answers.
+#   sudo ./install.sh             New server: the setup wizard. Installed: a menu.
+#   sudo ./install.sh install     The full setup wizard; keeps earlier answers.
+#   sudo ./install.sh update      Install this checkout's version without questions.
 #   sudo ./install.sh services    Look for services again and update the registry.
+#   sudo ./install.sh enroll      Enroll again with a new key.
 #   sudo ./install.sh status      Show what is running and recent problems.
 #   sudo ./install.sh uninstall   Stop and remove the agents (keeps /etc/humlab-agents).
 #
@@ -156,12 +159,18 @@ configure() {
     domain=$(ask "Blackbox domain" "$(env_get DOMAIN "$DEFAULT_DOMAIN")")
 
     enroll "$host" "$domain"
+    write_env "$host" "$domain"
+}
 
-    local tmp
+# Writes agents.env from the given server name and domain and the current
+# values of everything else, adding settings that are new in this checkout.
+write_env() {
+    local host=$1 domain=$2 tmp
     tmp=$(mktemp "$ENV_FILE.XXXXXX")
     cat >"$tmp" <<EOF
-# Humlab agents: settings for this server. Written by install.sh; re-run it after
-# editing so the Vector config is rendered again. Secrets live in $SECRETS_DIR.
+# Humlab agents: settings for this server. Written by install.sh; after editing,
+# run "sudo ./install.sh update" so the Vector config is rendered again.
+# Secrets live in $SECRETS_DIR.
 HOST_NAME=$host
 DOMAIN=$domain
 OPENSEARCH_URL=https://api.opensearch.$domain
@@ -449,17 +458,53 @@ do_install() {
     start_agents
     check_connections
     echo
-    log "Done. 'sudo ./install.sh status' shows the agents; the first SBOM scan runs within a day"
-    log "(start it now with: sudo systemctl start humlab-sbom.service)."
+    log "Done. 'sudo ./install.sh' now opens a menu for later changes; the first SBOM scan"
+    log "runs within a day (start it from the menu with S)."
+}
+
+installed() {
+    [ -f "$ENV_FILE" ] && [ -x "$CLI" ]
+}
+
+require_installed() {
+    installed || fail "Agents are not installed yet; run: sudo $0"
+}
+
+# The wizard without questions: this checkout's binaries, agent, Vector config
+# and units, with the settings and services already on the server.
+do_update() {
+    preflight update
+    require_installed
+    install_binaries
+    create_users
+    write_env "$(env_get HOST_NAME "")" "$(env_get DOMAIN "$DEFAULT_DOMAIN")"
+    configure_docker_logs
+    install_files
+    remove_legacy_agents
+    start_agents
+    check_connections
 }
 
 do_services() {
     preflight services
-    [ -x "$CLI" ] || fail "Agents are not installed yet; run: sudo $0"
+    require_installed
     # Use this checkout's discovery code, not the copy from the last install.
     install -m 755 "$SCRIPT_DIR/agent/humlab_agents.py" "$LIB_DIR/humlab_agents.py"
     "$CLI" services
     "$CLI" inventory
+}
+
+do_enroll() {
+    preflight enroll
+    require_installed
+    local host domain
+    host=$(env_get HOST_NAME "")
+    domain=$(env_get DOMAIN "$DEFAULT_DOMAIN")
+    enroll "$host" "$domain"
+    [ "$ENROLLED" = 1 ] || { log "Kept the current credentials"; return 0; }
+    # Vector reads its passwords at start (LoadCredential=).
+    systemctl restart humlab-vector.service
+    check_connections
 }
 
 do_status() {
@@ -489,10 +534,138 @@ do_uninstall() {
     log "Delete those and the users humlab-vector and humlab-sbom by hand if you don't need them."
 }
 
-case "${1:-install}" in
+# --- Menu (installed servers) ---
+
+find_services() {
+    "$CLI" services
+    "$CLI" inventory
+}
+
+remove_service() {
+    local names name
+    names=$(sed -n 's/^\[\(.*\)\]$/\1/p' "$CONF_DIR/services.conf" 2>/dev/null)
+    [ -n "$names" ] || { echo "No services are registered."; return 0; }
+    echo "Registered services:"
+    printf '  %s\n' $names
+    name=$(ask "Service to remove (blank to cancel)")
+    [ -n "$name" ] || return 0
+    "$CLI" remove "$name"
+    "$CLI" inventory
+}
+
+# Runs the SBOM service and shows its output. Ctrl-C stops watching; the scan
+# carries on in the background.
+run_scan() {
+    local since follow
+    since=$(date +%s)
+    echo "Scanning every service's images; this can take a while. Ctrl-C stops watching,"
+    echo "the scan carries on in the background."
+    echo
+    journalctl -f -n 0 -o cat -u humlab-sbom.service --since "@$since" &
+    follow=$!
+    if systemctl start humlab-sbom.service; then
+        sleep 1; kill "$follow" 2>/dev/null || true
+        echo; log "Scan finished"
+    else
+        sleep 1; kill "$follow" 2>/dev/null || true
+        echo; warn "Some images were not uploaded; see the ERROR lines above"
+    fi
+}
+
+# True if this checkout would install something different from what runs now.
+checkout_differs() {
+    local rendered differs=1
+    cmp -s "$SCRIPT_DIR/agent/humlab_agents.py" "$LIB_DIR/humlab_agents.py" || return 0
+    rendered=$(mktemp)
+    if "$CLI" render "$SCRIPT_DIR/vector/vector.yaml" "$ENV_FILE" >"$rendered" 2>/dev/null \
+        && cmp -s "$rendered" "$VECTOR_CONF_DIR/vector.yaml"; then
+        differs=0
+        local u
+        for u in "${UNITS[@]}"; do
+            cmp -s "$SCRIPT_DIR/systemd/$u" "$UNIT_DIR/$u" || differs=1
+        done
+    fi
+    rm -f "$rendered"
+    [ $differs = 1 ]
+}
+
+menu_header() {
+    local count scan when
+    count=$(grep -c '^\[' "$CONF_DIR/services.conf" 2>/dev/null || true)
+    scan=$(systemctl show -p Result --value humlab-sbom.service 2>/dev/null || true)
+    when=$(systemctl show -p ExecMainExitTimestamp --value humlab-sbom.service 2>/dev/null || true)
+    echo
+    echo "=== Humlab agents: $(env_get HOST_NAME "?") -> $(env_get DOMAIN "?") ==="
+    echo "  Log and metric shipping: $(systemctl is-active humlab-vector.service 2>/dev/null || true)"
+    echo "  Registered services:     ${count:-0}"
+    if [ -n "$when" ]; then
+        echo "  Last SBOM scan:          $([ "$scan" = success ] && echo OK || echo "failed ($scan)"), $when"
+    else
+        echo "  Last SBOM scan:          not run since boot"
+    fi
+    checkout_differs && echo "  This checkout differs from what is installed: choose U to update."
+    cat <<'EOF'
+
+  [A] Agent status and recent warnings
+  [L] List services and their running containers
+  [F] Find new services
+  [R] Remove a service
+  [E] Enroll with a new key
+  [C] Check the connections to blackbox
+  [S] Scan images and upload SBOMs now
+  [U] Update the agents from this checkout (after git pull)
+  [W] Run the whole setup wizard again
+  [X] Uninstall
+  [Q] Quit
+EOF
+}
+
+# Runs a menu choice in a subshell, so a failure (fail exits) returns to the
+# menu. Not as "( ... ) || warn": inside an || list bash ignores set -e, also in
+# the subshell, and a failing step would not stop the action.
+run_action() {
+    local rc
+    set +e
+    ( set -e; "$@" )
+    rc=$?
+    set -e
+    [ $rc = 0 ] || warn "That did not finish (exit $rc)"
+}
+
+do_menu() {
+    preflight menu
+    [ -t 0 ] || fail "The menu needs a terminal. Commands: $0 {install|update|services|enroll|status|uninstall}"
+    local choice
+    trap ':' INT
+    while :; do
+        menu_header
+        read -r -p "Choice: " choice || { echo; return 0; }
+        echo
+        case "${choice,,}" in
+            a) run_action do_status ;;
+            l) run_action "$CLI" list ;;
+            f) run_action find_services ;;
+            r) run_action remove_service ;;
+            e) run_action do_enroll ;;
+            c) run_action check_connections ;;
+            s) run_action run_scan ;;
+            u) run_action do_update ;;
+            w) run_action do_install ;;
+            x) run_action do_uninstall; installed || return 0 ;;
+            q|"") return 0 ;;
+            *) echo "Unknown choice: $choice"; continue ;;
+        esac
+        read -r -p "Press Enter for the menu " _ || return 0
+    done
+}
+
+case "${1:-}" in
+    "")        if installed; then do_menu; else do_install; fi ;;
     install)   do_install ;;
+    update)    do_update ;;
     services)  do_services ;;
+    enroll)    do_enroll ;;
     status)    do_status ;;
     uninstall) do_uninstall ;;
-    *) sed -n '3,9p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *) sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
