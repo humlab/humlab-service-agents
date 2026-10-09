@@ -76,10 +76,11 @@ class Service:
 
     def matches(self, labels: dict, name_fallback: bool = True) -> bool:
         """True if a compose container (by its labels) belongs to this service:
-        by its working directory while that exists, otherwise (if name_fallback)
-        by compose project name. Many projects share a name such as "docker"."""
+        by its working directory, or (if name_fallback) by compose project name
+        when it has none (older podman-compose). A working directory that no
+        longer exists matches nothing: many projects share a name like "docker"."""
         wd = labels.get(WORKING_DIR_LABEL)
-        if wd and os.path.isdir(wd):
+        if wd:
             return same_path(wd, self.path)
         return name_fallback and labels.get("com.docker.compose.project") == self.compose_project
 
@@ -620,14 +621,14 @@ def find_running_project(path: str, running: list, services: list):
     """(project, how it matched) for the running project that a compose directory
     holds, or (None, ''). The working-dir label decides when it leads to a
     directory; otherwise a project name the directory declares, if no
-    registered service has that project yet, preferring the directory's owner."""
+    registered service has that project yet, preferring the directory's owner.
+    Only projects without a working-dir label match by name."""
     real = os.path.realpath(path)
     exact = next((p for p in running if p.working_dir == real), None)
     if exact:
         return exact, "working directory"
     names = declared_project_names(path)
-    loose = [p for p in running if p.name in names
-             and not (p.working_dir and os.path.isdir(p.working_dir))
+    loose = [p for p in running if p.name in names and not p.working_dir
              and not any(s.deployment == "compose" and (s.runtime, s.owner) == (p.runtime, p.owner)
                          and s.matches(p.labels) for s in services)]
     dir_owner = pwd.getpwuid(os.stat(path).st_uid).pw_name
@@ -677,8 +678,30 @@ def uncovered_containers(services: list, listed: dict) -> list:
     return lines
 
 
-def default_name(path: str, fallback: str) -> str:
-    return re.sub(r"[^a-z0-9._-]+", "-", os.path.basename(os.path.normpath(path)).lower()).strip("-.") or fallback
+# Directory names that say how a project is deployed rather than what it is,
+# and the environment names that are kept as a suffix.
+GENERIC_DIRS = {"docker", "compose", "docker-compose", "podman", "container", "containers",
+                "deploy", "deployment", "deployments", "infra", "ops", "src", "app"}
+ENV_DIRS = {"production", "prod", "staging", "stage", "test", "testing", "dev", "development", "local"}
+
+
+def suggest_name(path: str, fallback: str) -> str:
+    """A service name for a project directory: its own name, or for a directory
+    named after the deployment the project it belongs to, keeping environment
+    names: swedeb-api/docker -> swedeb-api, swedeb-api/docker/compose/production
+    -> swedeb-api-production. Stops at a home directory or a search root."""
+    stops = {"/"} | set(DEFAULT_ROOTS) | {pw.pw_dir for pw in pwd.getpwall()}
+    path = os.path.normpath(path)
+    envs = []
+    while os.path.dirname(path) not in stops:
+        base = os.path.basename(path).lower()
+        if base in ENV_DIRS:
+            envs.insert(0, base)
+        elif base not in GENERIC_DIRS:
+            break
+        path = os.path.dirname(path)
+    parts = [os.path.basename(path).lower()] + [e for e in envs if e != os.path.basename(path).lower()]
+    return re.sub(r"[^a-z0-9._-]+", "-", "-".join(parts)).strip("-.") or fallback
 
 
 def user_exists(name: str) -> bool:
@@ -744,7 +767,7 @@ def cmd_services(args) -> int:
         what = f"Podman containers of {owner}" if whole_user else f"Podman project {project} (user {owner})"
         print(f"{what}, started by systemd: {', '.join(units)}")
         if auto or ask_yes("  Monitor it?", True):
-            name = default_name(project, owner)
+            name = suggest_name(project, owner)
             if auto:
                 name = name if name not in taken else f"{name}-{len(taken)}"
             else:
@@ -767,7 +790,11 @@ def cmd_services(args) -> int:
             runtime, owner, project = info.runtime, info.owner, info.name
         else:
             runtime, owner, project = "", pwd.getpwuid(os.stat(path).st_uid).pw_name, compose_project_name(path)
-        default_name = project or compose_project_name(path)
+        # A project name set in the compose file says more than a directory name.
+        if project and project != compose_project_name(path):
+            default_name = project
+        else:
+            default_name = suggest_name(path, compose_project_name(path))
         if not interactive:
             name = default_name if default_name not in taken else f"{default_name}-{len(taken)}"
         else:
@@ -857,14 +884,58 @@ def cmd_remove(args) -> int:
     return 0
 
 
+def print_services(services: list) -> None:
+    for i, s in enumerate(services, 1):
+        print(f"{i:3}. {s.name:24} {s.deployment:8} {s.runtime:7} owner={s.owner:12} {s.path}")
+        for c in s.containers:
+            print(f"       {c['name']:36} {c['image']}")
+        if not s.containers:
+            print("       (no running containers)")
+
+
 def cmd_list(args) -> int:
     services = load_registry()
     attach_containers(services)
-    for s in services:
-        print(f"{s.name:24} {s.deployment:8} {s.runtime:7} owner={s.owner:12} {s.path}")
-        for c in s.containers:
-            print(f"    {c['name']:36} {c['image']}")
+    print_services(services)
     return 0
+
+
+def cmd_edit(args) -> int:
+    """Numbered list of the services; rename or unregister one at a time."""
+    services = load_registry()
+    attach_containers(services)
+    while True:
+        print_services(services)
+        if not services:
+            return 0
+        try:
+            choice = input("\nNumber of a service to change (blank to finish): ").strip()
+        except EOFError:
+            choice = ""
+        if not choice:
+            return 0
+        if not (choice.isdigit() and 1 <= int(choice) <= len(services)):
+            print(f"  Enter a number from 1 to {len(services)}.\n")
+            continue
+        s = services[int(choice) - 1]
+        print(f"\n{s.name}: {s.deployment} project in {s.path}")
+        action = input("  [N] New name  [D] Unregister  [Enter] Back: ").strip().lower()
+        if action == "n":
+            suggestion = suggest_name(s.path, s.name)
+            name = ask_name(suggestion, {x.name for x in services} - {s.name})
+            if name != s.name:
+                print(f"  Renamed {s.name} to {name}. New logs and metrics use the new name; stored logs keep\n"
+                      f"  the old one. Dependency-Track gets a project '{name}' at the next scan; the old\n"
+                      f"  project '{s.name}' stays there until you delete it.")
+                s.name = name
+                save_registry(services)
+                services.sort(key=lambda x: x.name)
+        elif action == "d":
+            if ask_yes(f"  Unregister {s.name}?", False):
+                services.remove(s)
+                save_registry(services)
+                print(f"  Unregistered {s.name}. Its containers are now logged under their own names.")
+        print()
 
 
 def cmd_render(args) -> int:
@@ -891,6 +962,7 @@ def main() -> int:
     p.add_argument("--yes", action="store_true", help="register quadlet users, systemd-started projects and running compose projects without asking")
     p.set_defaults(func=cmd_services)
     sub.add_parser("list", help="show registered services").set_defaults(func=cmd_list)
+    sub.add_parser("edit", help="rename or unregister services, picked by number").set_defaults(func=cmd_edit)
     p = sub.add_parser("remove", help="unregister services")
     p.add_argument("service", nargs="+")
     p.set_defaults(func=cmd_remove)

@@ -541,15 +541,8 @@ find_services() {
     "$CLI" inventory
 }
 
-remove_service() {
-    local names name
-    names=$(sed -n 's/^\[\(.*\)\]$/\1/p' "$CONF_DIR/services.conf" 2>/dev/null)
-    [ -n "$names" ] || { echo "No services are registered."; return 0; }
-    echo "Registered services:"
-    printf '  %s\n' $names
-    name=$(ask "Service to remove (blank to cancel)")
-    [ -n "$name" ] || return 0
-    "$CLI" remove "$name"
+edit_services() {
+    "$CLI" edit
     "$CLI" inventory
 }
 
@@ -607,9 +600,8 @@ menu_header() {
     cat <<'EOF'
 
   [A] Agent status and recent warnings
-  [L] List services and their running containers
+  [L] List and change services (rename, unregister)
   [F] Find new services
-  [R] Remove a service
   [E] Enroll with a new key
   [C] Check the connections to blackbox
   [S] Scan images and upload SBOMs now
@@ -643,9 +635,8 @@ do_menu() {
         echo
         case "${choice,,}" in
             a) run_action do_status ;;
-            l) run_action "$CLI" list ;;
+            l) run_action edit_services ;;
             f) run_action find_services ;;
-            r) run_action remove_service ;;
             e) run_action do_enroll ;;
             c) run_action check_connections ;;
             s) run_action run_scan ;;

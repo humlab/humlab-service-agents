@@ -91,9 +91,8 @@ wizard:
 
 ```
   [A] Agent status and recent warnings
-  [L] List services and their running containers
+  [L] List and change services (rename, unregister)
   [F] Find new services
-  [R] Remove a service
   [E] Enroll with a new key
   [C] Check the connections to blackbox
   [S] Scan images and upload SBOMs now
@@ -169,6 +168,12 @@ runtime directory. It warns about a user whose running containers it cannot
 list, usually because lingering is off. Then it lists the running containers
 that no registered service covers, so you can add their directories by hand.
 
+The suggested service name skips directories named after the deployment: a
+project in `swedeb-api/docker` is offered as `swedeb-api`, one in
+`swedeb-api/docker/compose/production` as `swedeb-api-production`. A project
+name set in the compose file (`name:`) is offered as is. Rename a service later
+with **L** in the menu.
+
 After deploying something new, look again with **F** in the menu. It offers only
 compose projects with running containers; the others are counted and can be
 listed, or added by path.
@@ -202,7 +207,7 @@ names change, e.g. one per user session) are grouped by image instead:
 sudo ./install.sh                           # the menu
 sudo ./install.sh status                    # units, timers, services, recent warnings
 sudo humlab-agents list                     # services and their containers
-sudo humlab-agents remove <service>         # unregister a service
+sudo humlab-agents edit                     # rename or unregister services by number
 sudo systemctl start humlab-sbom.service    # scan now
 journalctl -u humlab-vector -f              # agent log
 ```
