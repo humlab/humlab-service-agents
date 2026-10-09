@@ -18,7 +18,11 @@ RestartSec=10
 # Passwords are root-only files, handed to this service in /run/credentials/.
 LoadCredential=opensearch_password:/etc/humlab-agents/secrets/opensearch.password
 LoadCredential=prometheus_password:/etc/humlab-agents/secrets/prometheus.password
+# The disk buffer holds logs from every journal on the host (sshd, other users'
+# services). Keep it, and anything Vector writes, private to this service.
 StateDirectory=humlab-vector
+StateDirectoryMode=0700
+UMask=0077
 
 # Stay out of the way of the services being monitored.
 Nice=5

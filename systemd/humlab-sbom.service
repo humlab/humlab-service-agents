@@ -15,3 +15,12 @@ Nice=15
 IOSchedulingClass=idle
 # No PrivateTmp: rootless Podman joins the owner's existing mount namespace
 # and would not see a private /var/tmp. Temp dirs are 0700, per scan.
+MemoryHigh=3G
+MemoryMax=6G
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native

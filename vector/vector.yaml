@@ -1,6 +1,6 @@
 # Humlab telemetry agent, one per server.
 #
-#   journald (container stdout/stderr + host logs) -> OpenSearch logs-container-* / logs-syslog-*
+#   journald (container stdout/stderr + host logs) -> OpenSearch logs-container-<host>_* / logs-syslog-<host>_*
 #   host_metrics (host + per-container cgroups)    -> Prometheus remote write
 #
 # install.sh renders this template to /etc/humlab-agents/vector/vector.yaml,
@@ -8,7 +8,7 @@
 # longer interpolates environment variables by default). Passwords stay out of
 # the file: they come from systemd credentials (LoadCredential= in
 # humlab-vector.service). Field and index rules follow the
-# blackbox client guide: monthly logs-<source>-YYYY.MM indices, ECS field names,
+# blackbox client guide: monthly logs-<source>-<host>_YYYY.MM indices, ECS field names,
 # a `host` label on every metric.
 
 data_dir: "@DATA_DIR@"
@@ -20,8 +20,9 @@ secret:
     remove_trailing_whitespace: true
 
 enrichment_tables:
-  # container id -> service, written every 2 minutes by `humlab-agents inventory`,
-  # which reloads Vector when it changes.
+  # container id -> service, and the uid of the user whose runtime runs it,
+  # written every 2 minutes by `humlab-agents inventory`, which reloads Vector
+  # when it changes.
   inventory:
     type: file
     file:
@@ -33,6 +34,7 @@ enrichment_tables:
       container_name: string
       service: string
       image: string
+      owner_uid: string
 
 sources:
   # Reads the system journal and every user's journal (the service runs in the
@@ -65,6 +67,15 @@ sources:
     type: internal_metrics
     scrape_interval_secs: 30
 
+  # One line every 5 minutes, so that blackbox can tell a quiet server from one
+  # whose logs stopped arriving ("Server stopped sending logs" fires after 30
+  # minutes without any line).
+  heartbeat_src:
+    type: demo_logs
+    format: shuffle
+    lines: ["humlab-vector heartbeat"]
+    interval: 300.0
+
 transforms:
   logs_shape:
     type: remap
@@ -72,31 +83,64 @@ transforms:
     drop_on_abort: true
     source: |
       out = {"@timestamp": .timestamp, "host": {"name": "@HOST_NAME@"}}
-      cid = to_string(.CONTAINER_ID_FULL) ?? ""
-      cname = to_string(.CONTAINER_NAME) ?? ""
-      # Podman and Docker log stderr at priority 3, stdout at 6.
-      stream = if .PRIORITY == "3" { "stderr" } else { "stdout" }
+
+      # Journal fields that do not start with "_" (CONTAINER_*, SYSLOG_*,
+      # PRIORITY, MESSAGE) can be set by any local user, for example with
+      # `logger --journald`. Only the "_" fields are set by journald itself, so
+      # trust is decided on those: which program sent the entry (_EXE), through
+      # which channel (_TRANSPORT), and for which unit (_SYSTEMD_UNIT).
+      exe = to_string(._EXE) ?? ""
+      transport = to_string(._TRANSPORT) ?? ""
+      cid = ""
+      cname = ""
+      stream = "stdout"
       image = ""
       if .source_type == "docker_logs" {
         cid = to_string(.container_id) ?? ""
         cname = to_string(.container_name) ?? ""
         stream = to_string(.stream) ?? "stdout"
         image = to_string(.image) ?? ""
+      } else if match(exe, r'^/(usr/(local/)?)?(s?bin|libexec(/podman)?|lib/podman)/(conmon|conmonrs|dockerd)$') ||
+                match(exe, r'^/snap/docker/[^/]+/(usr/)?s?bin/dockerd$') {
+        # Written by the container runtime's logging driver. Podman and Docker
+        # log stderr at priority 3, stdout at 6.
+        id = to_string(.CONTAINER_ID_FULL) ?? ""
+        if match(id, r'^[0-9a-f]{64}$') {
+          # Any user can run conmon, with any container id. A registered
+          # container's lines come from its owner's runtime, so the same id sent
+          # by another user (_UID, set by journald) is forged and stays a host line.
+          owner = ""
+          row, err = get_enrichment_table_record("inventory", {"container_id": id})
+          if err == null { owner = to_string(row.owner_uid) ?? "" }
+          if owner == "" || owner == (to_string(._UID) ?? "") { cid = id }
+        }
+        cname = to_string(.CONTAINER_NAME) ?? ""
+        stream = if .PRIORITY == "3" { "stderr" } else { "stdout" }
       }
 
       message = replace(to_string(.message) ?? encode_json(.message), r'\r?\n$', "")
-      # Routine noise, not worth storing: firewall drops, container healthchecks
-      # (HTTP probes and the MongoDB connection each probe opens and closes),
-      # MongoDB checkpoint notices, and nginx's error line for every 404 (the
-      # access log has the request too).
-      if match_any(message, [
-        r'\[UFW (BLOCK|ALLOW|AUDIT)\]',
-        r'\[error\] .*open\(\) ".*" failed \(2: No such file or directory\)',
-        r'"(GET|HEAD) /(health|healthz|healthcheck|is_alive|ping)[/? ]',
-        r'"(GET|HEAD) / HTTP/[0-9.]+" .*"curl/[0-9.]+"',
-        r'"s":"I",\s*"c":"(NETWORK|ACCESS)",.*"msg":"(Connection accepted|Connection ended|client metadata|Authentication succeeded)"',
-        r'"msg":"WiredTiger message".*WT_VERB_CHECKPOINT_PROGRESS'
-      ]) { abort }
+
+      # Routine noise, not worth storing. Each pattern applies only to the
+      # source that writes such lines and is anchored to the start of the line
+      # (or to the line's fixed layout), so a user cannot make their own lines
+      # disappear by adding the text to a user name or a User-Agent.
+      #   kernel: firewall drops.
+      #   containers: healthchecks (HTTP probes and the MongoDB connection each
+      #   probe opens and closes), MongoDB checkpoint notices, and nginx's error
+      #   line for every 404 (the access log has the request too).
+      noise = false
+      if cid != "" {
+        noise = match_any(message, [
+          r'^[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9:]{8} \[error\] [0-9]+#[0-9]+: \*[0-9]+ open\(\) "[^"]*" failed \(2: No such file or directory\), client: ',
+          r'^[^"]*"(GET|HEAD) /(health|healthz|healthcheck|is_alive|ping)/? HTTP/[0-9.]+" ',
+          r'^[^"]*"(GET|HEAD) / HTTP/[0-9.]+" [0-9]+ [0-9-]+ "[^"]*" "curl/[0-9.]+"\s*$',
+          r'^\{"t":\{"\$date":"[^"]*"\},"s":"I",\s*"c":"(NETWORK|ACCESS)",\s*"id":[0-9]+,\s*"ctx":"[^"]*",\s*"msg":"(Connection accepted|Connection ended|client metadata|Authentication succeeded)"',
+          r'^\{"t":\{"\$date":"[^"]*"\},"s":"I",\s*"c":"[A-Z]+",\s*"id":[0-9]+,\s*"ctx":"[^"]*",\s*"msg":"WiredTiger message",\s*"attr":\{.*WT_VERB_CHECKPOINT_PROGRESS'
+        ])
+      } else if transport == "kernel" {
+        noise = match(message, r'^\[UFW (BLOCK|ALLOW|AUDIT)\]')
+      }
+      if noise { abort }
 
       if cid != "" {
         service = cname
@@ -107,6 +151,10 @@ transforms:
         }
         out.service = {"name": service}
         out.container = {"id": cid, "name": cname}
+        # Who ran the runtime that sent the line. For a container that is not
+        # registered this is the only check on its name.
+        sender = to_string(._UID) ?? ""
+        if sender != "" { out.user = {"id": sender} }
         if image != "" { out.container.image = {"name": image} }
         out.stream = stream
         out.index_source = "container"
@@ -114,37 +162,91 @@ transforms:
         # Host log: keep warnings and worse, plus everything from HOST_LOG_UNITS.
         prio = to_int(.PRIORITY) ?? 6
         unit = to_string(._SYSTEMD_UNIT) ?? ""
+        uid = to_string(._UID) ?? ""
         # The agents' own discovery and SBOM runs are sent in full, so what they
         # registered, unregistered or uploaded shows up on blackbox.
         listed = unit != "" && (includes(split("@HOST_LOG_UNITS@", " "), unit) ||
                                 includes(["humlab-discover.service", "humlab-sbom.service"], unit))
-        if prio > @HOST_LOG_MAX_PRIORITY@ && !listed { abort }
+        comm = to_string(._COMM) ?? ""
+        # Authentication events, selected by the program that sent them: sudo,
+        # su, login and the account tools log at notice or info from the user's
+        # own session, so priority and unit do not find them. A short-lived tool
+        # (useradd) can exit before journald reads its path; then its name
+        # (_COMM) counts, but only from root: any process can rename itself, none
+        # can send as uid 0.
+        auth = match(exe, r'^/(usr/(local/)?)?s?bin/(sudo|sudo-rs|su|su-rs|login|newgrp|sg|pkexec|doas|visudo|useradd|usermod|userdel|groupadd|groupmod|groupdel|passwd|chpasswd|chage|gpasswd|vipw|vigr)$') ||
+               (exe == "" && uid == "0" && match(comm, r'^(sudo|sudo-rs|su|su-rs|login|newgrp|sg|pkexec|doas|visudo|useradd|usermod|userdel|groupadd|groupmod|groupdel|passwd|chpasswd|chage|gpasswd|vipw|vigr)$'))
+        accepted = match(exe, r'^/usr/(local/)?(s?bin|lib/openssh|libexec(/openssh)?)/sshd(-session)?$') &&
+                   match(message, r'^Accepted ')
+        if prio > @HOST_LOG_MAX_PRIORITY@ && !listed && !auth { abort }
         level = "info"
         if prio <= 3 { level = "error" } else if prio == 4 { level = "warn" } else if prio == 7 { level = "debug" }
-        ident = to_string(.SYSLOG_IDENTIFIER) ?? to_string(._COMM) ?? "unknown"
+        # The service is the name the line logs under (SYSLOG_IDENTIFIER), but
+        # any sender can claim any name: a user's `logger -t sshd` would show up
+        # among the SSH logins. So the claimed name counts only from the kernel,
+        # from a system account (uid below 1000, root included), or when it is
+        # the name of the program that sent the line (_EXE, set by journald).
+        # Otherwise the program's name is used, and the claim kept in
+        # log.syslog.appname.
+        claimed = to_string(.SYSLOG_IDENTIFIER) ?? ""
+        program = replace(exe, r'^.*/', "")
+        system_sender = transport == "kernel" || (to_int(uid) ?? 65534) < 1000
+        ident = "unknown"
+        if claimed != "" && (system_sender || claimed == program) {
+          ident = claimed
+        } else if program != "" {
+          ident = program
+        } else if system_sender && comm != "" {
+          ident = comm
+        }
         out.service = {"name": ident}
         out.log = {"level": level}
-        out.process = {"name": to_string(._COMM) ?? "", "pid": to_int(._PID) ?? 0}
+        if claimed != "" && claimed != ident { out.log.syslog = {"appname": claimed} }
+        out.process = {"name": comm, "pid": to_int(._PID) ?? 0}
+        # Where the line really came from, whatever name it logs under.
+        if exe != "" { out.process.executable = exe }
+        if uid != "" { out.user = {"id": uid} }
         if unit != "" { out.systemd = {"unit": unit} }
         user_unit = to_string(._SYSTEMD_USER_UNIT) ?? ""
         if user_unit != "" { out.systemd.user_unit = user_unit }
         out.index_source = "syslog"
-        # For logs_repeats: the message with ids and numbers blanked out.
-        out.repeat_key = ident + " " + replace(message, r'[0-9a-f]{8,}|[0-9]+', "#")
+        # For logs_repeats: sender and message, with ids and numbers blanked
+        # out. The sender is what journald recorded, not a name the line chose,
+        # so one user's lines cannot use up another program's allowance.
+        origin = if unit != "" { unit } else if exe != "" { exe } else { transport }
+        out.repeat_key = origin + " " + uid + " " + replace(message, r'[0-9a-f]{8,}|[0-9]+', "#")
+        # Logins and privilege changes are never thinned out.
+        out.throttle_skip = auth || accepted
       }
       out.message = message
+      # The index is named by the month the line passes through here, not by its
+      # own timestamp: blackbox creates each server's indices for this month and
+      # the next (the server may not create them), so an old or future-dated
+      # line must not need another one.
+      out.index_month = format_timestamp!(now(), format: "%Y.%m", timezone: "UTC")
       . = out
 
   # A failing unit can log the same warning every few seconds (a broken
   # container healthcheck: ~40k lines a day). Keep the first 10 host log lines
-  # of each kind per 10 minutes; container logs pass untouched.
+  # of each kind per 10 minutes; container logs and authentication events pass
+  # untouched.
+  heartbeat_shape:
+    type: remap
+    inputs: [heartbeat_src]
+    source: |
+      . = {"@timestamp": now(), "host": {"name": "@HOST_NAME@"},
+           "service": {"name": "humlab-vector"}, "log": {"level": "info"},
+           "event": {"kind": "state", "dataset": "humlab.heartbeat"},
+           "message": "humlab-vector heartbeat", "index_source": "syslog", "throttle_skip": true,
+           "index_month": format_timestamp!(now(), format: "%Y.%m", timezone: "UTC")}
+
   logs_repeats:
     type: throttle
-    inputs: [logs_shape]
+    inputs: [logs_shape, heartbeat_shape]
     threshold: 10
     window_secs: 600
     key_field: "{{ repeat_key }}"
-    exclude: '.index_source != "syslog"'
+    exclude: '.index_source != "syslog" || .throttle_skip == true'
 
   metrics_shape:
     type: remap
@@ -179,7 +281,11 @@ sinks:
     api_version: v8
     mode: bulk
     bulk:
-      index: "logs-{{ index_source }}-%Y.%m"
+      # The server's name is part of the index: its account on blackbox may only
+      # write to logs-<source>-<this name>_*, so no other server can write to it,
+      # and it cannot block or fill another server's indices. Blackbox creates
+      # them, for this month and the next (index_month, set above).
+      index: "logs-{{ index_source }}-@HOST_NAME@_{{ index_month }}"
       action: index
     auth:
       strategy: basic
@@ -187,7 +293,7 @@ sinks:
       password: "SECRET[creds.opensearch_password]"
     compression: gzip
     encoding:
-      except_fields: [index_source, repeat_key]
+      except_fields: [index_source, index_month, repeat_key, throttle_skip]
     batch:
       max_events: 2000
       max_bytes: 8000000

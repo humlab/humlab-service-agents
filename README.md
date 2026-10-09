@@ -4,19 +4,31 @@ Client side of the blackbox monitoring stack. One install per server sends:
 
 | What | Where | How |
 |---|---|---|
-| Container logs (stdout/stderr) | OpenSearch, `logs-container-YYYY.MM` | Vector reads the journal |
-| Host logs (warnings and worse, plus sshd) | OpenSearch, `logs-syslog-YYYY.MM` | Vector reads the journal |
+| Container logs (stdout/stderr) | OpenSearch, `logs-container-<server>_YYYY.MM` | Vector reads the journal |
+| Host logs (warnings and worse, plus sshd and authentication events) | OpenSearch, `logs-syslog-<server>_YYYY.MM` | Vector reads the journal |
 | Host metrics and per-container CPU/memory | Prometheus remote write | Vector `host_metrics` |
 | SBOM per container image, daily | Dependency-Track | Syft |
 
-Some log lines are never sent: firewall drops (`[UFW BLOCK]`), container
+Some log lines are never sent: kernel firewall drops (`[UFW BLOCK]`), container
 healthcheck requests (`GET /health`, `/healthz`, `/is_alive`, `/ping`, curl
 requests for `/`), the MongoDB connection and authentication lines each probe
 causes, MongoDB checkpoint notices, and nginx's error line for each 404 (the
-access log already has the request). Host logs are also rate-limited: at most
-10 lines of the same kind (same program, same text apart from numbers and ids)
-per 10 minutes. The rules are in `logs_shape` and `logs_repeats` in
-`vector/vector.yaml`.
+access log already has the request). Each rule applies only to the source that
+writes such lines (kernel, or container) and only to the start of the line, so
+text inside a user name or User-Agent cannot make a line disappear. Host logs
+are also rate-limited: at most 10 lines of the same kind (same sender, same
+text apart from numbers and ids) per 10 minutes; logins and privilege changes
+are never thinned out.
+
+Host logs are warnings and worse, everything from `HOST_LOG_UNITS`, and
+authentication events: sudo, su, login, pkexec and the account tools (useradd,
+usermod, passwd, ...), whatever their priority. Journal fields that do not start
+with `_` (`CONTAINER_*`, `SYSLOG_*`, `PRIORITY`) can be set by any local user, so
+trust rests on the `_` fields journald adds: a line counts as a container line
+only when it comes from the container runtime (conmon or dockerd, by `_EXE`),
+the throttle key is built from the sender, and `process.executable` and
+`user.id` are stored with every host line. The rules are in `logs_shape` and
+`logs_repeats` in `vector/vector.yaml`; `vector/tests/run.sh` tests them.
 
 It works the same on servers that run services as rootless quadlets (one user
 per service under `/srv/<service>`), with podman-compose, or with docker-compose.
@@ -71,7 +83,7 @@ sudo ./install.sh
 
 The installer:
 
-1. Downloads Vector and Syft (pinned versions, checksums verified) to
+1. Downloads Vector and Syft (pinned versions and SHA-256 checksums) to
    `/usr/local/lib/humlab-agents/bin/`.
 2. Asks for the server name, the blackbox domain and the enrollment key, and
    enrolls the server. Enter keeps the earlier answers, and the current
@@ -214,6 +226,16 @@ Log documents follow the blackbox client guide: `@timestamp`, `host.name`,
 `container.image.name` and `stream` for container lines, and `log.level`,
 `process.*` and `systemd.unit` for host lines.
 
+`service.name` of a host line is the name it logs under (`SYSLOG_IDENTIFIER`)
+only when that comes from the kernel, a system account (uid below 1000) or the
+program that sent it; otherwise it is the program's own name, and the claimed
+name is in `log.syslog.appname`. `user.id` is the uid that sent the line, for
+host and container lines alike.
+
+Every 5 minutes the agent also sends a heartbeat line (`service.name:
+humlab-vector`, `event.dataset: humlab.heartbeat`), so blackbox can tell a quiet
+server from one whose logs stopped.
+
 Metrics carry `host` (required by the push-health alert in Grafana).
 Per-container series are `host_cgroup_cpu_usage_seconds_total`,
 `host_cgroup_memory_current_bytes` and similar, with `service` and `container`
@@ -247,11 +269,25 @@ journalctl -u humlab-vector -f              # agent log
 | `/etc/humlab-agents/ignored.conf` | Services automatic discovery leaves alone |
 | `/etc/humlab-agents/secrets/` | Passwords and API key from enrollment (root only) |
 | `/etc/humlab-agents/vector/` | Rendered Vector config |
-| `/var/lib/humlab-agents/inventory.csv` | Container to service map |
-| `/var/lib/humlab-vector/` | Journal position and disk buffers (up to about 1.3 GB) |
+| `/var/lib/humlab-agents/inventory.csv` | Container to service map, with the uid whose runtime runs each container |
+| `/var/lib/humlab-vector/` | Journal position and disk buffers (up to about 1.3 GB); private to `humlab-vector` (mode 0700) |
 
 When blackbox is unreachable, Vector buffers to disk and catches up afterwards.
 The journal position is saved, so a restart of the agent loses nothing either.
+
+## Trusting the checkout
+
+`install.sh`, the agent and the systemd units are installed as root from this
+checkout, and again at every update. Whoever can push to the repository, or write
+to the checkout on a server, therefore gets root on every server that updates
+from it. Keep that narrow:
+
+- Clone it as root into `/opt` (not a home directory), so that it is owned by
+  root. `install.sh` warns when it is not.
+- Install from a signed tag, not a branch: `git fetch --tags && git verify-tag
+  <tag> && git checkout <tag>`.
+- On GitHub, protect the main branch (required review, no force pushes) and
+  require signed commits or tags for releases.
 
 ## Repository layout
 
@@ -260,5 +296,7 @@ install.sh              installer: setup wizard, then a menu (also install, upda
 agent/humlab_agents.py  service registry, inventory, SBOM scans
 vector/vector.yaml      Vector config template (@...@ filled in by install.sh)
 vector/docker-logs.yaml Docker API log source, only when chosen
+vector/tests/           unit tests for the log transforms: vector/tests/run.sh [path/to/vector]
+tests/                  tests for the agent: python3 -m unittest discover -s tests
 systemd/                units and timers
 ```

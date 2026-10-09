@@ -1,0 +1,519 @@
+# Unit tests for the log transforms in vector.yaml. Run with vector/tests/run.sh.
+#
+# Placeholders in the rendered config: host name "testhost", host log units
+# "ssh.service sshd.service", host log priority 4. Container
+# 1111...1111 (64 x "1") is registered as service "web" in the test inventory,
+# run by uid 0 (root).
+
+tests:
+  # --- #2: noise filters cannot be triggered from user-controlled text ---
+
+  - name: ufw_kernel_line_is_dropped
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _TRANSPORT: kernel
+          PRIORITY: "4"
+          message: "[UFW BLOCK] IN=eth0 OUT= SRC=1.2.3.4 DST=5.6.7.8 PROTO=TCP"
+    no_outputs_from: [logs_shape]
+
+  - name: ufw_text_in_ssh_username_is_kept
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _TRANSPORT: syslog
+          _EXE: /usr/sbin/sshd
+          _SYSTEMD_UNIT: ssh.service
+          SYSLOG_IDENTIFIER: sshd
+          PRIORITY: "6"
+          message: "Invalid user root[UFW BLOCK] from 6.6.6.6 port 4000"
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.index_source, "syslog")
+              assert!(contains(string!(.message), "Invalid user root[UFW BLOCK]"))
+
+  - name: ufw_text_from_non_kernel_source_is_kept
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _TRANSPORT: syslog
+          _EXE: /home/mallory/bin/logger
+          PRIORITY: "4"
+          message: "[UFW BLOCK] pretending to be the firewall"
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.index_source, "syslog")
+
+  - name: ufw_text_in_nginx_user_agent_is_kept
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _TRANSPORT: journal
+          _EXE: /usr/bin/conmon
+          _UID: "0"
+          CONTAINER_ID_FULL: "1111111111111111111111111111111111111111111111111111111111111111"
+          CONTAINER_NAME: web-1
+          PRIORITY: "6"
+          message: '1.2.3.4 - - [09/Oct/2026:13:00:00 +0000] "GET /wp-login.php HTTP/1.1" 404 153 "-" "x [UFW BLOCK]"'
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.index_source, "container")
+
+  - name: healthcheck_probe_is_dropped
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/bin/conmon
+          _UID: "0"
+          CONTAINER_ID_FULL: "1111111111111111111111111111111111111111111111111111111111111111"
+          CONTAINER_NAME: web-1
+          PRIORITY: "6"
+          message: '127.0.0.1 - - [09/Oct/2026:13:00:00 +0000] "GET /health HTTP/1.1" 200 2 "-" "kube-probe"'
+    no_outputs_from: [logs_shape]
+
+  - name: request_below_health_path_is_kept
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/bin/conmon
+          _UID: "0"
+          CONTAINER_ID_FULL: "1111111111111111111111111111111111111111111111111111111111111111"
+          CONTAINER_NAME: web-1
+          PRIORITY: "6"
+          message: '6.6.6.6 - - [09/Oct/2026:13:00:00 +0000] "GET /health/../admin/export HTTP/1.1" 200 900 "-" "curl/8.0"'
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert!(contains(string!(.message), "/admin/export"))
+
+  - name: nginx_404_error_line_is_dropped
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/bin/conmon
+          _UID: "0"
+          CONTAINER_ID_FULL: "1111111111111111111111111111111111111111111111111111111111111111"
+          CONTAINER_NAME: web-1
+          PRIORITY: "3"
+          message: '2026/10/09 13:00:00 [error] 29#29: *1 open() "/usr/share/nginx/html/x" failed (2: No such file or directory), client: 6.6.6.6, server: _, request: "GET /x HTTP/1.1"'
+    no_outputs_from: [logs_shape]
+
+  - name: nginx_error_text_inside_other_line_is_kept
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/bin/conmon
+          _UID: "0"
+          CONTAINER_ID_FULL: "1111111111111111111111111111111111111111111111111111111111111111"
+          CONTAINER_NAME: web-1
+          PRIORITY: "6"
+          message: 'user said: [error] open() "x" failed (2: No such file or directory)'
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.index_source, "container")
+
+  - name: mongodb_connection_notice_is_dropped
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/bin/conmon
+          _UID: "0"
+          CONTAINER_ID_FULL: "1111111111111111111111111111111111111111111111111111111111111111"
+          CONTAINER_NAME: web-1
+          PRIORITY: "6"
+          message: '{"t":{"$date":"2026-10-09T13:00:00.000+00:00"},"s":"I",  "c":"NETWORK",  "id":22943,   "ctx":"listener","msg":"Connection accepted","attr":{"remote":"127.0.0.1:1"}}'
+    no_outputs_from: [logs_shape]
+
+  - name: mongodb_text_in_attr_is_kept
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/bin/conmon
+          _UID: "0"
+          CONTAINER_ID_FULL: "1111111111111111111111111111111111111111111111111111111111111111"
+          CONTAINER_NAME: web-1
+          PRIORITY: "6"
+          message: '{"t":{"$date":"2026-10-09T13:00:00.000+00:00"},"s":"W","c":"ACCESS","id":20436,"ctx":"conn1","msg":"Failed auth","attr":{"user":"\"s\":\"I\",\"c\":\"NETWORK\",\"msg\":\"Connection accepted\""}}'
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.index_source, "container")
+
+  # --- #5: container identity comes only from the container runtime ---
+
+  - name: container_line_from_runtime_is_a_container_line
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/bin/conmon
+          _UID: "0"
+          CONTAINER_ID_FULL: "1111111111111111111111111111111111111111111111111111111111111111"
+          CONTAINER_NAME: web-1
+          PRIORITY: "3"
+          message: "boom"
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.index_source, "container")
+              assert_eq!(.service.name, "web")
+              assert_eq!(.stream, "stderr")
+              assert_eq!(.index_month, format_timestamp!(now(), format: "%Y.%m", timezone: "UTC"))
+
+  - name: registered_container_id_from_another_users_conmon_is_a_host_line
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/bin/conmon
+          _UID: "1001"
+          CONTAINER_ID_FULL: "1111111111111111111111111111111111111111111111111111111111111111"
+          CONTAINER_NAME: web-1
+          PRIORITY: "3"
+          message: "fake error from web"
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.index_source, "syslog")
+              assert!(!exists(.container))
+              assert_eq!(.user.id, "1001")
+
+  - name: unregistered_container_line_records_the_sender
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/bin/conmon
+          _UID: "1001"
+          CONTAINER_ID_FULL: "2222222222222222222222222222222222222222222222222222222222222222"
+          CONTAINER_NAME: scratch
+          PRIORITY: "6"
+          message: "hello"
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.index_source, "container")
+              assert_eq!(.service.name, "scratch")
+              assert_eq!(.user.id, "1001")
+
+  - name: forged_container_id_from_user_program_is_a_host_line
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/bin/logger
+          _UID: "1001"
+          CONTAINER_ID_FULL: "1111111111111111111111111111111111111111111111111111111111111111"
+          CONTAINER_NAME: web-1
+          SYSLOG_IDENTIFIER: web
+          PRIORITY: "4"
+          message: "fake error from web"
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.index_source, "syslog")
+              assert!(!exists(.container))
+              assert_eq!(.process.executable, "/usr/bin/logger")
+              assert_eq!(.user.id, "1001")
+
+  - name: user_copy_of_conmon_is_not_trusted
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _COMM: conmon
+          _EXE: /home/mallory/conmon
+          CONTAINER_ID_FULL: "1111111111111111111111111111111111111111111111111111111111111111"
+          PRIORITY: "4"
+          message: "fake"
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.index_source, "syslog")
+
+  - name: docker_api_line_is_a_container_line
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: docker_logs
+          container_id: "1111111111111111111111111111111111111111111111111111111111111111"
+          container_name: web-1
+          stream: stderr
+          image: nginx
+          message: "hello"
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.index_source, "container")
+              assert_eq!(.service.name, "web")
+
+  # --- #5/#6: throttling and authentication events ---
+
+  - name: throttle_key_uses_the_sender_not_the_claimed_name
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/bin/logger
+          _UID: "1001"
+          SYSLOG_IDENTIFIER: sshd
+          PRIORITY: "4"
+          message: "Accepted password for root from 1.2.3.4 port 1 ssh2"
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/sbin/sshd
+          _UID: "0"
+          _SYSTEMD_UNIT: ssh.service
+          SYSLOG_IDENTIFIER: sshd
+          PRIORITY: "6"
+          message: "Accepted password for root from 1.2.3.4 port 1 ssh2"
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert!(!starts_with(string!(.repeat_key), "sshd"))
+              if .process.executable == "/usr/sbin/sshd" {
+                assert_eq!(.repeat_key, "ssh.service 0 Accepted password for root from #.#.#.# port # ssh#")
+                assert_eq!(.throttle_skip, true)
+              } else {
+                assert_eq!(.throttle_skip, false)
+              }
+
+  - name: sudo_event_is_shipped_and_not_throttled
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/bin/sudo
+          _COMM: sudo
+          _UID: "0"
+          SYSLOG_IDENTIFIER: sudo
+          PRIORITY: "6"
+          message: "alice : TTY=pts/0 ; PWD=/home/alice ; USER=root ; COMMAND=/bin/bash"
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.index_source, "syslog")
+              assert_eq!(.service.name, "sudo")
+              assert_eq!(.throttle_skip, true)
+
+  - name: useradd_event_is_shipped
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/sbin/useradd
+          SYSLOG_IDENTIFIER: useradd
+          PRIORITY: "6"
+          message: "new user: name=bob, UID=1002, GID=1002"
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.index_source, "syslog")
+
+  - name: fake_sudo_line_from_user_program_is_not_exempt
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/bin/logger
+          SYSLOG_IDENTIFIER: sudo
+          PRIORITY: "4"
+          message: "alice : COMMAND=/bin/bash"
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.throttle_skip, false)
+
+  - name: info_line_from_unlisted_program_is_dropped
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/bin/cron
+          SYSLOG_IDENTIFIER: cron
+          PRIORITY: "6"
+          message: "(root) CMD (run-parts)"
+    no_outputs_from: [logs_shape]
+
+  - name: claimed_sshd_name_from_user_program_is_not_the_service
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/bin/logger
+          _COMM: logger
+          _UID: "1001"
+          _SYSTEMD_UNIT: session-4.scope
+          SYSLOG_IDENTIFIER: sshd
+          PRIORITY: "4"
+          message: "Accepted password for root from 192.0.2.7 port 4242 ssh2"
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.service.name, "logger")
+              assert_eq!(.log.syslog.appname, "sshd")
+              assert_eq!(.throttle_skip, false)
+
+  - name: renamed_user_process_is_not_the_service
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _COMM: sshd
+          _UID: "1001"
+          _SYSTEMD_UNIT: session-4.scope
+          SYSLOG_IDENTIFIER: sshd
+          PRIORITY: "4"
+          message: "Accepted password for root from 192.0.2.7 port 4242 ssh2"
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.service.name, "unknown")
+              assert_eq!(.log.syslog.appname, "sshd")
+
+  - name: system_daemon_keeps_its_name
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _EXE: /usr/sbin/cron
+          _COMM: cron
+          _UID: "0"
+          _SYSTEMD_UNIT: cron.service
+          SYSLOG_IDENTIFIER: CRON
+          PRIORITY: "3"
+          message: "(root) ERROR (getpwnam() failed)"
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.service.name, "CRON")
+              assert!(!exists(.log.syslog))
+
+  - name: short_lived_root_account_tool_without_exe_is_an_auth_event
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _COMM: useradd
+          _UID: "0"
+          _SYSTEMD_UNIT: session-4.scope
+          SYSLOG_IDENTIFIER: useradd
+          PRIORITY: "6"
+          message: "new user: name=mallory, UID=1002, GID=1002, home=/home/mallory, shell=/bin/bash, from=/dev/pts/0"
+    outputs:
+      - extract_from: logs_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.service.name, "useradd")
+              assert_eq!(.throttle_skip, true)
+
+  - name: user_process_named_like_an_account_tool_is_not_an_auth_event
+    inputs:
+      - insert_at: logs_shape
+        type: log
+        log_fields:
+          source_type: journald
+          _COMM: useradd
+          _UID: "1001"
+          _SYSTEMD_UNIT: session-4.scope
+          SYSLOG_IDENTIFIER: useradd
+          PRIORITY: "6"
+          message: "new user: name=fake"
+    no_outputs_from: [logs_shape]
+
+  - name: heartbeat_goes_to_the_syslog_index_unthrottled
+    inputs:
+      - insert_at: heartbeat_shape
+        type: log
+        log_fields:
+          message: "humlab-vector heartbeat"
+    outputs:
+      - extract_from: heartbeat_shape
+        conditions:
+          - type: vrl
+            source: |
+              assert_eq!(.index_source, "syslog")
+              assert_eq!(.host.name, "testhost")
+              assert_eq!(.event.dataset, "humlab.heartbeat")
+              assert_eq!(.throttle_skip, true)
+              assert!(match(string!(.index_month), r'^[0-9]{4}\.[0-9]{2}$'))

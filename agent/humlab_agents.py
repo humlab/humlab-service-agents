@@ -21,6 +21,7 @@ import os
 import pwd
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,12 @@ PROJECT_MARKERS = (".git", ".env") + COMPOSE_FILES
 SYSTEM_PATHS = ("/etc/", "/run/", "/var/run/", "/proc/", "/sys/", "/dev/", "/tmp/", "/usr/")
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+# Compose project names, as Compose itself restricts them.
+PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+# Most a user-controlled file is read for, and how many drop-ins of a unit.
+MAX_USER_FILE = 1 << 20
+MAX_DROPINS = 50
 
 # Names Docker and Podman make up for a container started without --name
 # (adjective_surname). They change whenever the container is recreated.
@@ -92,6 +99,20 @@ def log(msg: str) -> None:
     if JOURNAL:
         prefix = "<3>" if msg.startswith("ERROR") else "<4>" if msg.startswith("WARNING") else ""
     print(prefix + msg, file=sys.stderr, flush=True)
+
+
+def read_user_file(path: str, limit: int = MAX_USER_FILE) -> str:
+    """Text of a file that a user controls, read as root. Refuses symlinks, FIFOs,
+    devices (a symlink to /dev/zero) and anything but a regular file, and reads
+    at most limit bytes. Raises OSError for what it refuses."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a regular file")
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return f.read(limit).decode(errors="replace")
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------- registry
@@ -153,6 +174,9 @@ def load_registry() -> list:
     cp.read(REGISTRY)
     services = []
     for name in cp.sections():
+        if not NAME_RE.match(name):
+            log(f"WARNING: {REGISTRY}: ignoring service with invalid name {name!r}")
+            continue
         s = cp[name]
         services.append(Service(name=name, deployment=s.get("deployment", "compose"),
                                 runtime=s.get("runtime", "podman"), owner=s.get("owner", "root"),
@@ -164,6 +188,12 @@ def load_registry() -> list:
 def save_registry(services: list) -> None:
     cp = configparser.ConfigParser(interpolation=None)
     for s in sorted(services, key=lambda s: s.name):
+        # Names and values come from container labels, which any user with a
+        # rootless Podman controls. A newline would add sections to this file.
+        if not NAME_RE.match(s.name) or any(CONTROL_CHARS.search(v) for v in
+                                            (s.deployment, s.runtime, s.owner, s.path, s.project, s.container)):
+            log(f"WARNING: not registering service {s.name!r}: its name or settings contain unusable characters")
+            continue
         cp[s.name] = {"deployment": s.deployment, "runtime": s.runtime, "owner": s.owner, "path": s.path}
         if s.project and s.project != compose_project_name(s.path):
             cp[s.name]["project"] = s.project
@@ -198,7 +228,8 @@ def load_ignored() -> dict:
 def save_ignored(ignored: dict) -> None:
     lines = ["# Services that automatic discovery leaves alone: declined, or unregistered",
              "# by hand. Delete a line to have it offered again. Written by humlab-agents.", ""]
-    lines += [f"{k}  # {c}" if c else k for k, c in sorted(ignored.items())]
+    lines += [f"{k}  # {c}" if c else k for k, c in sorted(ignored.items())
+              if not CONTROL_CHARS.search(k + c)]
     IGNORED.parent.mkdir(parents=True, exist_ok=True)
     tmp = IGNORED.with_suffix(".tmp")
     tmp.write_text("\n".join(lines) + "\n")
@@ -235,8 +266,11 @@ def run_as(owner: str, argv: list, env: dict = None, timeout: int = 120,
         kwargs = {"user": pw.pw_uid, "group": pw.pw_gid,
                   "extra_groups": os.getgrouplist(owner, pw.pw_gid)}
     full_env.update(env or {})
+    # No stdin and a session of its own: the command must not read what the
+    # admin types at the terminal, or share its session.
     return subprocess.run(argv, env=full_env, cwd="/", capture_output=True, text=True,
-                          timeout=timeout, check=True, **kwargs)
+                          timeout=timeout, check=True, stdin=subprocess.DEVNULL,
+                          start_new_session=True, **kwargs)
 
 
 def list_containers(runtime: str, owner: str) -> list:
@@ -331,9 +365,9 @@ def host_paths(unit_file: str, owner: str) -> list:
     """Host paths a quadlet loads or mounts (EnvironmentFile=, Volume=, Mount=), drop-ins included."""
     pw = pwd.getpwnam(owner)
     paths = []
-    for f in [unit_file] + sorted(glob.glob(glob.escape(unit_file) + ".d/*.conf")):
+    for f in [unit_file] + sorted(glob.glob(glob.escape(unit_file) + ".d/*.conf"))[:MAX_DROPINS]:
         try:
-            lines = Path(f).read_text(errors="replace").splitlines()
+            lines = read_user_file(f).splitlines()
         except OSError:
             continue
         for line in lines:
@@ -397,10 +431,16 @@ def systemd_projects(owner: str, containers: list) -> dict:
 def cmd_inventory(args) -> int:
     services = load_registry()
     attach_containers(services)
-    lines = ["container_id,container_name,service,image"]
+    # owner_uid: Vector accepts a registered container's journal lines only from
+    # this user's runtime (anyone can run conmon and claim a container id).
+    lines = ["container_id,container_name,service,image,owner_uid"]
     for s in services:
+        try:
+            uid = str(pwd.getpwnam(s.owner).pw_uid)
+        except KeyError:
+            uid = ""
         for c in s.containers:
-            lines.append(",".join(csv_field(v) for v in (c["id"], c["name"], s.name, c["image"])))
+            lines.append(",".join(csv_field(v) for v in (c["id"], c["name"], s.name, c["image"], uid)))
     content = "\n".join([lines[0]] + sorted(lines[1:])) + "\n"
     if INVENTORY.exists() and INVENTORY.read_text() == content:
         return 0
@@ -488,23 +528,39 @@ def scan_image(svc: Service, container: dict) -> dict:
     """Save the container's image to a tar and run syft on it, both unprivileged
     where possible: a rootless Podman image is saved and scanned as its owner;
     docker and rootful Podman images are saved as root and scanned as SCAN_USER.
+
+    The scanner never gets a directory that root writes into. Root-run saves go
+    to a directory only root can write to; the finished archive is handed over
+    with a chown that does not follow symlinks, and the scanner gets its own
+    work directory below it.
     """
     rootless = svc.runtime == "podman" and svc.owner != "root"
     scanner = pwd.getpwnam(svc.owner if rootless else SCAN_USER)
     tmp = tempfile.mkdtemp(prefix="humlab-sbom-", dir="/var/tmp")
     try:
-        os.chown(tmp, scanner.pw_uid, scanner.pw_gid)
         archive = os.path.join(tmp, "image.tar")
+        if rootless:
+            # The owner saves and scans in its own directory; root only removes it.
+            os.chown(tmp, scanner.pw_uid, scanner.pw_gid)
+            work = tmp
+        else:
+            # Root-owned and not writable by the scanner, which can only traverse it.
+            os.chmod(tmp, 0o711)
+            work = os.path.join(tmp, "work")
+            os.mkdir(work, 0o700)
+            os.chown(work, scanner.pw_uid, scanner.pw_gid, follow_symlinks=False)
         run_as(svc.owner if rootless else "root",
                [svc.runtime, "image", "save", "-o", archive, container["image_id"] or container["image"]],
                env={"TMPDIR": tmp}, timeout=3600)
         if not rootless:
-            os.chown(archive, scanner.pw_uid, scanner.pw_gid)
+            if not stat.S_ISREG(os.lstat(archive).st_mode):
+                raise RuntimeError(f"{archive} is not a regular file")
+            os.chown(archive, scanner.pw_uid, scanner.pw_gid, follow_symlinks=False)
         name, version = split_image_ref(container["image"])
         out = run_as(scanner.pw_name,
                      [str(BIN_DIR / "syft"), "-q", f"docker-archive:{archive}", "-o", "cyclonedx-json",
                       "--source-name", name, "--source-version", version],
-                     env={"SYFT_CHECK_FOR_APP_UPDATE": "false", "XDG_CACHE_HOME": tmp, "TMPDIR": tmp},
+                     env={"SYFT_CHECK_FOR_APP_UPDATE": "false", "XDG_CACHE_HOME": work, "TMPDIR": work},
                      timeout=3600, user_session=False).stdout
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -692,8 +748,13 @@ def running_compose_projects(listed: dict) -> list:
     for (runtime, owner), containers in listed.items():
         for c in containers:
             name = c["labels"].get("com.docker.compose.project")
+            wd = c["labels"].get(WORKING_DIR_LABEL, "")
+            # Labels are set by whoever starts the container; a name or directory
+            # with control characters can only be an attempt to corrupt the registry.
+            if CONTROL_CHARS.search(f"{name or ''}{wd}"):
+                log(f"WARNING: ignoring compose project of container {c['name']}: its labels contain control characters")
+                continue
             if name:
-                wd = c["labels"].get(WORKING_DIR_LABEL, "")
                 key = (runtime, owner, name, os.path.realpath(wd) if wd else "")
                 projects.setdefault(key, []).append(c["name"])
     return [RunningProject(*key, sorted(names)) for key, names in sorted(projects.items())]
@@ -706,10 +767,11 @@ def declared_project_names(path: str) -> set:
     for f, pattern in [(f, r"^name:\s*['\"]?([^'\"\s#]+)") for f in COMPOSE_FILES] + \
                       [(".env", r"^COMPOSE_PROJECT_NAME=\s*['\"]?([^'\"\s#]+)")]:
         try:
-            text = Path(path, f).read_text(errors="replace")
+            text = read_user_file(os.path.join(path, f))
         except OSError:
             continue
-        names |= {m.group(1).lower() for m in re.finditer(pattern, text, re.M) if "$" not in m.group(1)}
+        names |= {m.group(1).lower() for m in re.finditer(pattern, text, re.M)
+                  if "$" not in m.group(1) and PROJECT_RE.match(m.group(1).lower())}
     return names
 
 
@@ -797,7 +859,7 @@ def suggest_name(path: str, fallback: str) -> str:
             break
         path = os.path.dirname(path)
     parts = [os.path.basename(path).lower()] + [e for e in envs if e != os.path.basename(path).lower()]
-    return re.sub(r"[^a-z0-9._-]+", "-", "-".join(parts)).strip("-.") or fallback
+    return clean_name("-".join(parts), fallback)
 
 
 def user_exists(name: str) -> bool:
@@ -830,7 +892,11 @@ def ask_name(default: str, taken: set) -> str:
 
 
 def clean_name(name: str, fallback: str) -> str:
-    return re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-.") or fallback
+    """name reduced to what NAME_RE accepts, or fallback (or "service") when nothing is left."""
+    cleaned = re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-._")
+    if NAME_RE.match(cleaned):
+        return cleaned
+    return fallback if NAME_RE.match(fallback) else "service"
 
 
 def name_from_units(units: list, fallback: str) -> str:
@@ -891,6 +957,8 @@ def cmd_services(args) -> int:
         if svc.key in registered or svc.key in asked:
             return
         asked.add(svc.key)
+        # Names can derive from container labels, which any user controls.
+        svc.name = clean_name(svc.name, "service")
         if auto:
             if not recommended or svc.key in ignored:
                 return

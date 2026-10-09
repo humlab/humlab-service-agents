@@ -16,7 +16,28 @@ set -euo pipefail
 
 VECTOR_VERSION=0.59.0
 SYFT_VERSION=1.54.1
+
+# SHA-256 of each release archive, pinned here so a tampered release cannot
+# vouch for itself with its own checksum file. When changing a version above,
+# replace these from the vendor's checksum list:
+#   Vector: .../releases/download/v<version>/vector-<version>-SHA256SUMS
+#   Syft:   .../releases/download/v<version>/syft_<version>_checksums.txt, after
+#           cosign verify-blob --bundle syft_<version>_checksums.txt.sigstore.json \
+#             --certificate-identity-regexp 'https://github.com/anchore/syft/.*' \
+#             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#             syft_<version>_checksums.txt
+declare -A PINNED_SHA256=(
+    [vector-0.59.0-x86_64-unknown-linux-musl.tar.gz]=a8dbc43c18ae25d0b23a712c9262f3aad904e352b1db5e7db1d9c4aecab59496
+    [vector-0.59.0-aarch64-unknown-linux-musl.tar.gz]=9a666b266168fc44a086741ed92a01880d5ae6e08e4bb49ef40a54e47cc5a8a0
+    [syft_1.54.1_linux_amd64.tar.gz]=c069905b391cc4c20a5ba65ad5c10be2a7ba074f8ea6ad203e24d14e303dad47
+    [syft_1.54.1_linux_arm64.tar.gz]=dfdf0537610113edbefe1f1fc6548bc957b2d77439636ec824fcf0e10d46d054
+)
 DEFAULT_DOMAIN=blackbox.humlab.umu.se
+
+# What enrollment keys and the passwords and API key they return look like.
+# Anything else is refused: these values end up in curl config text, where a
+# quote or newline would add directives (for example upload-file).
+SECRET_RE='^[A-Za-z0-9_-]{16,128}$'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB_DIR=/usr/local/lib/humlab-agents
@@ -95,19 +116,26 @@ preflight() {
         *) fail "Unsupported architecture: $(uname -m)" ;;
     esac
 
+    # install.sh and the agent code run as root from this checkout, at every
+    # update. Whoever can write to it gets root on this server.
+    local loose
+    loose=$(find "$SCRIPT_DIR" -path "$SCRIPT_DIR/.git" -prune -o \( ! -user root -o -perm -002 \) -print -quit 2>/dev/null || true)
+    [ -z "$loose" ] || warn "$loose (and perhaps more under $SCRIPT_DIR) is not owned by root or is world-writable. Whoever can write there gets root at the next install or update; use a checkout owned by root, for example in /opt, and check the signature of the tag you install (git verify-tag)."
+
     [ -d /var/log/journal ] || warn "The journal is not persistent (/var/log/journal is missing). Logs written while the agent is down are lost at reboot."
 }
 
 # --- Binaries ---
 
-# download_verified <url> <checksums-url> <dir>: fetches the file and checks it
-# against the release's checksum list.
+# download_verified <url> <dir>: fetches the file and checks it against the
+# SHA-256 pinned above.
 download_verified() {
-    local url=$1 sums_url=$2 dir=$3 file
+    local url=$1 dir=$2 file expected
     file=$(basename "$url")
+    expected=${PINNED_SHA256[$file]:-}
+    [ -n "$expected" ] || fail "No pinned checksum for $file"
     curl -sSfL --retry 3 -o "$dir/$file" "$url" || fail "Download failed: $url"
-    curl -sSfL --retry 3 -o "$dir/SUMS" "$sums_url" || fail "Download failed: $sums_url"
-    (cd "$dir" && grep -E " \*?$file\$" SUMS | sha256sum -c --quiet -) || fail "Checksum mismatch for $file"
+    echo "$expected  $file" | (cd "$dir" && sha256sum -c --quiet -) || fail "Checksum mismatch for $file"
 }
 
 install_binaries() {
@@ -120,7 +148,7 @@ install_binaries() {
     else
         log "Installing Vector $VECTOR_VERSION"
         local base=https://github.com/vectordotdev/vector/releases/download/v$VECTOR_VERSION
-        download_verified "$base/vector-$VECTOR_VERSION-$VECTOR_ARCH.tar.gz" "$base/vector-$VECTOR_VERSION-SHA256SUMS" "$tmp"
+        download_verified "$base/vector-$VECTOR_VERSION-$VECTOR_ARCH.tar.gz" "$tmp"
         tar -xzf "$tmp/vector-$VECTOR_VERSION-$VECTOR_ARCH.tar.gz" -C "$tmp"
         install -m 755 "$tmp/vector-$VECTOR_ARCH/bin/vector" "$BIN_DIR/vector"
     fi
@@ -130,7 +158,7 @@ install_binaries() {
     else
         log "Installing Syft $SYFT_VERSION"
         local base=https://github.com/anchore/syft/releases/download/v$SYFT_VERSION
-        download_verified "$base/syft_${SYFT_VERSION}_linux_$SYFT_ARCH.tar.gz" "$base/syft_${SYFT_VERSION}_checksums.txt" "$tmp"
+        download_verified "$base/syft_${SYFT_VERSION}_linux_$SYFT_ARCH.tar.gz" "$tmp"
         tar -xzf "$tmp/syft_${SYFT_VERSION}_linux_$SYFT_ARCH.tar.gz" -C "$tmp" syft
         install -m 755 "$tmp/syft" "$BIN_DIR/syft"
     fi
@@ -158,6 +186,7 @@ configure() {
     host=$(ask "Short name of this server (its name on blackbox)" "$(env_get HOST_NAME "$(hostname -s)")")
     [[ $host =~ ^[a-z0-9][a-z0-9.-]*$ ]] || fail "Server name must be lowercase letters, digits, '.' or '-'"
     domain=$(ask "Blackbox domain" "$(env_get DOMAIN "$DEFAULT_DOMAIN")")
+    [[ $domain =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || fail "Blackbox domain must be a host name"
 
     enroll "$host" "$domain"
     write_env "$host" "$domain"
@@ -222,7 +251,11 @@ enroll() {
             read -r -s -p "Enrollment key (on blackbox: ./enroll/enroll.sh key new): " key || true
         fi
         echo >&2
-        [ -n "$key" ] && break
+        if [ -n "$key" ]; then
+            [[ $key =~ $SECRET_RE ]] && break
+            echo "That does not look like an enrollment key (only letters, digits, '_' and '-')." >&2
+            continue
+        fi
         [ $have = 1 ] && return 0
         echo "A key is required." >&2
     done
@@ -243,12 +276,17 @@ enroll() {
         esac
         fail "Enrollment failed (HTTP $code): ${error:-no details}"
     fi
-    python3 - "$response" "$SECRETS_DIR" <<'PY' || { rm -f "$response"; fail "Unexpected answer from the enrollment service"; }
-import json, os, sys
+    python3 - "$response" "$SECRETS_DIR" "$SECRET_RE" <<'PY' || { rm -f "$response"; fail "Unexpected answer from the enrollment service"; }
+import json, os, re, sys
 r = json.load(open(sys.argv[1]))
 secrets = {"opensearch.password": r["opensearch"]["password"],
            "prometheus.password": r["prometheus"]["password"],
            "dtrack.apikey": r["dtrack"]["api_key"]}
+# Nothing is written unless every value is plain: they are later placed in curl config text.
+for name, value in secrets.items():
+    if not isinstance(value, str) or not re.fullmatch(sys.argv[3], value):
+        print(f"[install] ERROR: the enrollment service returned an unusable {name}", file=sys.stderr)
+        sys.exit(1)
 os.umask(0o077)
 for name, value in secrets.items():
     path = os.path.join(sys.argv[2], name)
@@ -356,28 +394,44 @@ remove_legacy_agents() {
     printf '  %s\n' "${found[@]}"
     ask_yes "Stop and remove them, with their images and env files (including the Dependency-Track API key copy)?" y || return 0
 
-    local env_file
     for home in "${found[@]}"; do
         user=$(stat -c %U "$home")
         uid=$(id -u "$user" 2>/dev/null) || { warn "No user owns $home, skipped"; continue; }
         log "Removing old agents for $user"
         systemctl --user -M "$user@" stop "${LEGACY_UNITS[@]/%/.service}" egress-network.service 2>/dev/null || true
-        for name in "${LEGACY_UNITS[@]}"; do
-            rm -f "$home/.config/containers/systemd/$name.container" "$home/configuration/quadlets/$name.container"
-            rm -rf -- "${home:?}/configuration/image_builds/$name"
-            env_file="$home/configuration/secrets/${name%-agent}.env"
-            if [ -f "$env_file" ] && grep -qE "${LEGACY_ENV_MARKER[$name]}" "$env_file"; then
-                rm -f "$env_file"
-            fi
-        done
-        rm -f "$home/.config/containers/systemd/egress.network" "$home/configuration/quadlets/egress.network"
+        remove_legacy_files "$user" "$home"
         systemctl --user -M "$user@" daemon-reload 2>/dev/null || true
         if [ -d "/run/user/$uid" ]; then
             runuser -u "$user" -- env XDG_RUNTIME_DIR="/run/user/$uid" HOME="$home" sh -c \
                 'cd / && podman rmi -f localhost/dtrack-agent:latest localhost/opensearch-agent:latest localhost/cadvisor-agent:latest; podman network rm egress-network' \
-                >/dev/null 2>&1 || true
+                </dev/null >/dev/null 2>&1 || true
         fi
     done
+}
+
+# Deletes the old agents' files as their owner, not as root: the service user
+# controls every directory on these paths and could replace one with a symlink
+# to make root delete something else.
+remove_legacy_files() {
+    local user=$1 home=$2 name marker script
+    script='cd / || exit 0
+home=$1; shift
+rm -f -- "$home/.config/containers/systemd/egress.network" "$home/configuration/quadlets/egress.network"
+while [ $# -gt 0 ]; do
+    name=$1; marker=$2; shift 2
+    rm -f -- "$home/.config/containers/systemd/$name.container" "$home/configuration/quadlets/$name.container"
+    rm -rf -- "$home/configuration/image_builds/$name"
+    env_file="$home/configuration/secrets/${name%-agent}.env"
+    if [ -f "$env_file" ] && grep -qE "$marker" "$env_file"; then
+        rm -f -- "$env_file"
+    fi
+done'
+    local args=()
+    for name in "${LEGACY_UNITS[@]}"; do
+        args+=("$name" "${LEGACY_ENV_MARKER[$name]}")
+    done
+    runuser -u "$user" -- env HOME="$home" sh -c "$script" sh "$home" "${args[@]}" </dev/null \
+        || warn "Could not remove all old agent files for $user"
 }
 
 start_agents() {
@@ -388,6 +442,8 @@ start_agents() {
         || { "$BIN_DIR/vector" validate --no-environment --config-dir "$VECTOR_CONF_DIR" >&2; fail "Vector config is invalid"; }
     systemctl enable --now "${TIMERS[@]}" >/dev/null
     systemctl enable humlab-vector.service >/dev/null 2>&1
+    # Buffers written by earlier versions were readable by every user.
+    [ -d /var/lib/humlab-vector ] && chmod -R go-rwx /var/lib/humlab-vector
     systemctl restart humlab-vector.service
     sleep 5
     systemctl is-active --quiet humlab-vector.service \
@@ -398,6 +454,15 @@ start_agents() {
 
 # http_code <url> <curl config>: status code of a GET. Credentials go in as a
 # curl config on stdin (-K -) so they never show in ps.
+# secret_value <file>: the file's content if it is a plain secret, else empty
+# (and the check that needs it fails). Secrets saved by earlier versions were
+# not checked when they were written.
+secret_value() {
+    local value
+    value=$(cat "$1" 2>/dev/null || true)
+    [[ $value =~ $SECRET_RE ]] && printf '%s' "$value"
+}
+
 http_code() {
     local url=$1 config=$2
     local code
@@ -414,13 +479,13 @@ check_connections() {
 
     echo
     echo "=== Connection checks ==="
-    code=$(http_code "$os_url/" "user = \"ingest-$host:$(cat "$SECRETS_DIR/opensearch.password")\"")
+    code=$(http_code "$os_url/" "user = \"ingest-$host:$(secret_value "$SECRETS_DIR/opensearch.password")\"")
     # Right after enrolling, blackbox may need a few seconds to allowlist this server.
     local tries=0
     while [ "$ENROLLED" = 1 ] && [ "$code" = 403 ] && [ $tries -lt 10 ]; do
         sleep 3
         tries=$((tries + 1))
-        code=$(http_code "$os_url/" "user = \"ingest-$host:$(cat "$SECRETS_DIR/opensearch.password")\"")
+        code=$(http_code "$os_url/" "user = \"ingest-$host:$(secret_value "$SECRETS_DIR/opensearch.password")\"")
     done
     case $code in
         200) echo "  OpenSearch:       OK" ;;
@@ -430,7 +495,7 @@ check_connections() {
     esac
 
     # Prometheus only accepts POST here; 405 (or 404) means auth and allowlist passed.
-    code=$(http_code "$prom_url" "user = \"metrics-$host:$(cat "$SECRETS_DIR/prometheus.password")\"")
+    code=$(http_code "$prom_url" "user = \"metrics-$host:$(secret_value "$SECRETS_DIR/prometheus.password")\"")
     case $code in
         404|405) echo "  Prometheus push:  OK" ;;
         401) echo "  Prometheus push:  wrong user or password (metrics-$host)"; ok=0 ;;
@@ -441,7 +506,7 @@ check_connections() {
     # Polling an unknown upload token needs BOM_UPLOAD and returns 200. The
     # token must be a valid v4 UUID; the nil UUID gets 400.
     code=$(http_code "$dt_url/api/v1/bom/token/6f1c2d3e-4b5a-4c7d-8e9f-0a1b2c3d4e5f" \
-        "header = \"X-Api-Key: $(cat "$SECRETS_DIR/dtrack.apikey")\"")
+        "header = \"X-Api-Key: $(secret_value "$SECRETS_DIR/dtrack.apikey")\"")
     case $code in
         200) echo "  Dependency-Track: OK" ;;
         401|403) echo "  Dependency-Track: API key rejected or missing BOM_UPLOAD permission"; ok=0 ;;

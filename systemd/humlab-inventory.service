@@ -11,3 +11,14 @@ ExecStart=/usr/local/bin/humlab-agents inventory
 Nice=10
 StateDirectory=humlab-agents
 StateDirectoryMode=0755
+# It reads files that users control; a hang or runaway read must not outlive
+# the next run or take the server's memory.
+TimeoutStartSec=10min
+MemoryMax=512M
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native

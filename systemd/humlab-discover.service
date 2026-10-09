@@ -11,3 +11,14 @@ EnvironmentFile=/etc/humlab-agents/agents.env
 ExecStart=/usr/local/bin/humlab-agents services --auto
 ExecStartPost=/usr/local/bin/humlab-agents inventory
 Nice=10
+# It reads files that users control; a hang or runaway read must not outlive
+# the next run or take the server's memory.
+TimeoutStartSec=30min
+MemoryMax=512M
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
