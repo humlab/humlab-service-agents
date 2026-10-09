@@ -469,13 +469,16 @@ def cmd_sbom(args) -> int:
             log(f"{svc.name}: no running containers, skipped")
             continue
         # Project tree: <service> @ <host>  ->  <service>/<container> @ <host>
-        # (<service>/image-<name> for containers without a stable name)
+        # (<service>/image-<name> for containers without a stable name).
+        # Blackbox turns projects tagged "service" into collections that add up
+        # their containers; a collection takes no BOM, but it exists, so go on.
         try:
-            dt.upload(svc.name, host, EMPTY_BOM, [host, svc.name])
+            dt.upload(svc.name, host, EMPTY_BOM, [host, svc.name, "service"])
         except (RuntimeError, OSError) as e:
-            log(f"ERROR: {svc.name}: cannot create parent project: {e}")
-            failures += 1
-            continue
+            if "collection project" not in str(e):
+                log(f"ERROR: {svc.name}: cannot create parent project: {e}")
+                failures += 1
+                continue
         boms = {}
         uploaded = set()
         for c in svc.containers:

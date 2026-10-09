@@ -199,7 +199,9 @@ In Dependency-Track, each service is a project `<service>` with version
 `<host>`, and each container a child project `<service>/<container>` with the
 same version. Containers that no systemd unit or compose file started (their
 names change, e.g. one per user session) are grouped by image instead:
-`<service>/image-<image name>`.
+`<service>/image-<image name>`. Service projects carry the tag `service`;
+blackbox turns them into collection projects within 10 minutes, so their
+vulnerability and component counts are the totals of their containers.
 
 ## Operating it
 
