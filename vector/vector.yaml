@@ -114,7 +114,10 @@ transforms:
         # Host log: keep warnings and worse, plus everything from HOST_LOG_UNITS.
         prio = to_int(.PRIORITY) ?? 6
         unit = to_string(._SYSTEMD_UNIT) ?? ""
-        listed = unit != "" && includes(split("@HOST_LOG_UNITS@", " "), unit)
+        # The agents' own discovery and SBOM runs are sent in full, so what they
+        # registered, unregistered or uploaded shows up on blackbox.
+        listed = unit != "" && (includes(split("@HOST_LOG_UNITS@", " "), unit) ||
+                                includes(["humlab-discover.service", "humlab-sbom.service"], unit))
         if prio > @HOST_LOG_MAX_PRIORITY@ && !listed { abort }
         level = "info"
         if prio <= 3 { level = "error" } else if prio == 4 { level = "warn" } else if prio == 7 { level = "debug" }

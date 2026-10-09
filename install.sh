@@ -28,9 +28,10 @@ ENV_FILE=$CONF_DIR/agents.env
 UNIT_DIR=/etc/systemd/system
 DOCKER_DROPIN=$UNIT_DIR/humlab-vector.service.d/docker.conf
 CLI=/usr/local/bin/humlab-agents
-TIMERS=(humlab-inventory.timer humlab-sbom.timer)
+TIMERS=(humlab-inventory.timer humlab-sbom.timer humlab-discover.timer)
 ENROLLED=0
-UNITS=(humlab-vector.service humlab-inventory.service humlab-inventory.timer humlab-sbom.service humlab-sbom.timer)
+UNITS=(humlab-vector.service humlab-inventory.service humlab-inventory.timer humlab-sbom.service humlab-sbom.timer
+       humlab-discover.service humlab-discover.timer)
 
 # Agents the previous per-user installer put in each service user's home, and a
 # line that only its env file for that agent contains. Env files are deleted
@@ -183,6 +184,12 @@ DT_URL=https://api.dtrack.$domain
 # (warning) and worse, plus everything from these units.
 HOST_LOG_MAX_PRIORITY=$(env_get HOST_LOG_MAX_PRIORITY 4)
 HOST_LOG_UNITS=$(env_get HOST_LOG_UNITS "ssh.service sshd.service")
+
+# Nightly service discovery (humlab-discover.timer): auto registers new
+# services and unregisters those without running containers for
+# SERVICE_EXPIRE_DAYS days. manual: only the menu (F) registers services.
+SERVICE_DISCOVERY=$(env_get SERVICE_DISCOVERY auto)
+SERVICE_EXPIRE_DAYS=$(env_get SERVICE_EXPIRE_DAYS 60)
 
 # Docker container logs when Docker does not log to journald: api or skip.
 DOCKER_LOGS=$(env_get DOCKER_LOGS "")
@@ -516,7 +523,7 @@ do_status() {
     [ -x "$CLI" ] && "$CLI" list
     echo
     echo "Warnings from the last hour:"
-    journalctl --no-pager -p warning --since -1h -n 20 -u humlab-vector.service -u humlab-inventory.service -u humlab-sbom.service || true
+    journalctl --no-pager -p warning --since -1h -n 20 -u humlab-vector.service -u humlab-inventory.service -u humlab-sbom.service -u humlab-discover.service || true
 }
 
 do_uninstall() {
@@ -601,6 +608,11 @@ menu_header() {
         echo "  Last SBOM scan:          $([ "$scan" = success ] && echo OK || echo "failed ($scan)"), $when"
     else
         echo "  Last SBOM scan:          not run since boot"
+    fi
+    if [ "$(env_get SERVICE_DISCOVERY auto)" = auto ]; then
+        echo "  Service discovery:       nightly; unregisters after $(env_get SERVICE_EXPIRE_DAYS 60) days without containers"
+    else
+        echo "  Service discovery:       manual (F)"
     fi
     checkout_differs && echo "  This checkout differs from what is installed: choose U to update."
     cat <<'EOF'

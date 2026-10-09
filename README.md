@@ -30,6 +30,7 @@ users' accounts.
 |---|---|---|
 | `humlab-vector.service` | `humlab-vector`, in group `systemd-journal` | Read the journal, `/proc` and cgroups. No container runtime access. |
 | `humlab-inventory.timer` (every 2 min) | root | List running containers, to map them to services. Switches to the owning user for rootless Podman. |
+| `humlab-discover.timer` (nightly, 23:30) | root | Register new services and unregister long-gone ones (next section). |
 | `humlab-sbom.timer` (daily) | root, dropping privileges | Saves each image as its owner (rootless Podman) or as root (Docker, rootful Podman), and runs Syft as the owner or as `humlab-sbom`. |
 
 Passwords and the API key are root-only files in `/etc/humlab-agents/secrets/`.
@@ -157,7 +158,14 @@ path = /data/sead_query_api
   line matches on the project name instead. The installer writes that line
   when the label doesn't lead to a directory but the project name does: the
   directory's name, `name:` in the compose file, or `COMPOSE_PROJECT_NAME`
-  in `.env`.
+  in `.env`. Running compose projects outside the search directories are found
+  through that label too.
+- **Container**: a container nothing else covers, started by hand (`podman
+  run`, `docker run`) or from a compose directory that no longer exists. One
+  service per container, matched by its name (`container =`). A name the
+  runtime made up (`heuristic_blackburn`) changes when the container is
+  recreated, so such containers are only offered, never registered
+  automatically.
 - **Owner**: the user whose Podman runs the containers, or `root` for Docker and
   rootful Podman. A rootless owner needs lingering (`loginctl enable-linger
   <user>`) so its containers and runtime directory exist without a login.
@@ -171,12 +179,30 @@ that no registered service covers, so you can add their directories by hand.
 The suggested service name skips directories named after the deployment: a
 project in `swedeb-api/docker` is offered as `swedeb-api`, one in
 `swedeb-api/docker/compose/production` as `swedeb-api-production`. A project
-name set in the compose file (`name:`) is offered as is. Rename a service later
-with **L** in the menu.
+name set in the compose file (`name:`) is offered as is. Systemd-started
+containers without a project directory (a quadlet in `/etc/containers/systemd`)
+are named after their unit, a standalone container after itself. Rename a
+service later with **L** in the menu.
 
-After deploying something new, look again with **F** in the menu. It offers only
-compose projects with running containers; the others are counted and can be
-listed, or added by path.
+### Automatic discovery
+
+Every night `humlab-discover.timer` does what **F** does, without asking:
+
+- It registers new services under their suggested names, except what was
+  declined in **F** or unregistered with **L**. Those are listed in
+  `/etc/humlab-agents/ignored.conf`; delete a line, or say yes in **F**, to
+  have one registered again.
+- It unregisters services that have had no running containers for
+  `SERVICE_EXPIRE_DAYS` days (60 by default). A service whose runtime cannot be
+  listed that night is kept. Its Dependency-Track projects are kept.
+
+What it changed is logged to the journal of `humlab-discover.service` and sent
+to blackbox (`systemd.unit: humlab-discover.service` in Discover). Set
+`SERVICE_DISCOVERY=manual` in `agents.env` (then **U**) to register services
+only through the menu.
+
+**F** in the menu offers only compose projects with running containers; the
+others are counted and can be listed, or added by path.
 Containers that belong to no registered service are still logged and measured,
 under their container name (logs) or `service="unregistered"` (metrics), and get
 no SBOM.
@@ -216,8 +242,9 @@ journalctl -u humlab-vector -f              # agent log
 
 | File | Contents |
 |---|---|
-| `/etc/humlab-agents/agents.env` | Server name, endpoints, host-log filter. Run `sudo ./install.sh update` after editing. |
+| `/etc/humlab-agents/agents.env` | Server name, endpoints, host-log filter, service discovery. Run `sudo ./install.sh update` after editing. |
 | `/etc/humlab-agents/services.conf` | Service registry |
+| `/etc/humlab-agents/ignored.conf` | Services automatic discovery leaves alone |
 | `/etc/humlab-agents/secrets/` | Passwords and API key from enrollment (root only) |
 | `/etc/humlab-agents/vector/` | Rendered Vector config |
 | `/var/lib/humlab-agents/inventory.csv` | Container to service map |

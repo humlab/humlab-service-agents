@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Service registry, container inventory and SBOM scanning for one server.
 
-  humlab-agents services [--yes]   Find services and register them (interactive)
+  humlab-agents services [--auto]  Find services and register them (interactive;
+                                   --auto: without asking, nightly)
   humlab-agents list               Show registered services and their containers
+  humlab-agents edit               Rename or unregister services, picked by number
   humlab-agents inventory          Map running containers to services for Vector
   humlab-agents sbom [SERVICE...]  Scan images with syft, upload to Dependency-Track
   humlab-agents render TPL ENV     Fill @NAME@ placeholders in TPL from ENV
@@ -27,10 +29,13 @@ import urllib.request
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 CONF_DIR = Path(os.environ.get("HUMLAB_AGENTS_CONF", "/etc/humlab-agents"))
 REGISTRY = CONF_DIR / "services.conf"
+# Services that were declined or unregistered; automatic discovery skips them.
+IGNORED = CONF_DIR / "ignored.conf"
 INVENTORY = Path(os.environ.get("HUMLAB_INVENTORY", "/var/lib/humlab-agents/inventory.csv"))
 BIN_DIR = Path(os.environ.get("HUMLAB_AGENTS_BIN", "/usr/local/lib/humlab-agents/bin"))
 SCAN_USER = "humlab-sbom"
@@ -50,11 +55,43 @@ PROJECT_MARKERS = (".git", ".env") + COMPOSE_FILES
 SYSTEM_PATHS = ("/etc/", "/run/", "/var/run/", "/proc/", "/sys/", "/dev/", "/tmp/", "/usr/")
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+# Names Docker and Podman make up for a container started without --name
+# (adjective_surname). They change whenever the container is recreated.
+GENERATED_NAME = re.compile(
+    r"^(admiring|adoring|affectionate|agitated|amazing|angry|awesome|beautiful|blissful|bold|"
+    r"boring|brave|busy|charming|clever|compassionate|competent|condescending|confident|cool|"
+    r"cranky|crazy|dazzling|determined|distracted|dreamy|eager|ecstatic|elastic|elated|elegant|"
+    r"eloquent|epic|exciting|fervent|festive|flamboyant|focused|friendly|frosty|funny|gallant|"
+    r"gifted|goofy|gracious|great|happy|hardcore|heuristic|hopeful|hungry|infallible|inspiring|"
+    r"intelligent|interesting|jolly|jovial|keen|kind|laughing|loving|lucid|magical|modest|musing|"
+    r"mystifying|naughty|nervous|nice|nifty|nostalgic|objective|optimistic|peaceful|pedantic|"
+    r"pensive|practical|priceless|quirky|quizzical|recursing|relaxed|reverent|romantic|sad|"
+    r"serene|sharp|silly|sleepy|stoic|strange|stupefied|suspicious|sweet|tender|thirsty|"
+    r"trusting|unruffled|upbeat|vibrant|vigilant|vigorous|wizardly|wonderful|xenodochial|"
+    r"youthful|zealous|zen)_[a-z]+$")
 SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
+def _stderr_is_journal() -> bool:
+    try:
+        dev, ino = os.environ["JOURNAL_STREAM"].split(":")
+        st = os.fstat(2)
+        return (st.st_dev, st.st_ino) == (int(dev), int(ino))
+    except (KeyError, ValueError, OSError):
+        return False
+
+
+# Under systemd, a <N> prefix sets the journal priority: errors and warnings
+# then reach blackbox, which only receives host logs of warning and worse.
+JOURNAL = _stderr_is_journal()
+
+
 def log(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
+    prefix = ""
+    if JOURNAL:
+        prefix = "<3>" if msg.startswith("ERROR") else "<4>" if msg.startswith("WARNING") else ""
+    print(prefix + msg, file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------- registry
@@ -62,13 +99,25 @@ def log(msg: str) -> None:
 @dataclass
 class Service:
     name: str
-    deployment: str            # quadlet | compose
+    deployment: str            # quadlet | compose | container
     runtime: str               # podman | docker
     owner: str                 # user whose runtime holds the containers (root for docker)
     path: str                  # quadlet: the user's home, or the project directory its
-                               # units come from; compose: the project directory
+                               # units come from; compose: the project directory;
+                               # container: ''
     project: str = ""          # compose project name, when it differs from the directory name
+    container: str = ""        # container: the container's name
+    last_seen: str = ""        # date it last had running containers (YYYY-MM-DD)
     containers: list = field(default_factory=list)
+
+    @property
+    def key(self) -> str:
+        """What the service is, independent of its name (for ignored.conf)."""
+        if self.deployment == "container":
+            return f"container {self.runtime} {self.owner} {self.container}"
+        if self.deployment == "quadlet":
+            return f"quadlet {self.owner} {os.path.realpath(self.path)}"
+        return f"compose {self.runtime} {self.owner} {os.path.realpath(self.path)}"
 
     @property
     def compose_project(self) -> str:
@@ -107,7 +156,8 @@ def load_registry() -> list:
         s = cp[name]
         services.append(Service(name=name, deployment=s.get("deployment", "compose"),
                                 runtime=s.get("runtime", "podman"), owner=s.get("owner", "root"),
-                                path=s.get("path", ""), project=s.get("project", "")))
+                                path=s.get("path", ""), project=s.get("project", ""),
+                                container=s.get("container", ""), last_seen=s.get("last_seen", "")))
     return services
 
 
@@ -117,6 +167,10 @@ def save_registry(services: list) -> None:
         cp[s.name] = {"deployment": s.deployment, "runtime": s.runtime, "owner": s.owner, "path": s.path}
         if s.project and s.project != compose_project_name(s.path):
             cp[s.name]["project"] = s.project
+        if s.container:
+            cp[s.name]["container"] = s.container
+        if s.last_seen:
+            cp[s.name]["last_seen"] = s.last_seen
     REGISTRY.parent.mkdir(parents=True, exist_ok=True)
     tmp = REGISTRY.with_suffix(".tmp")
     with open(tmp, "w") as f:
@@ -126,6 +180,34 @@ def save_registry(services: list) -> None:
         cp.write(f)
     os.chmod(tmp, 0o644)
     os.replace(tmp, REGISTRY)
+
+
+def load_ignored() -> dict:
+    """Service key -> comment, from ignored.conf."""
+    ignored = {}
+    try:
+        for line in IGNORED.read_text().splitlines():
+            key, _, comment = line.partition("#")
+            if key.strip():
+                ignored[key.strip()] = comment.strip()
+    except OSError:
+        pass
+    return ignored
+
+
+def save_ignored(ignored: dict) -> None:
+    lines = ["# Services that automatic discovery leaves alone: declined, or unregistered",
+             "# by hand. Delete a line to have it offered again. Written by humlab-agents.", ""]
+    lines += [f"{k}  # {c}" if c else k for k, c in sorted(ignored.items())]
+    IGNORED.parent.mkdir(parents=True, exist_ok=True)
+    tmp = IGNORED.with_suffix(".tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, IGNORED)
+
+
+def ignore(ignored: dict, s: Service, why: str) -> None:
+    ignored[s.key] = f"{s.name}, {why} {date.today().isoformat()}"
 
 
 # ---------------------------------------------------------------- runtimes
@@ -162,7 +244,8 @@ def list_containers(runtime: str, owner: str) -> list:
     if runtime == "podman":
         out = run_as(owner, ["podman", "ps", "--format", "json"]).stdout
         return [{"id": c["Id"], "name": (c.get("Names") or [c["Id"][:12]])[0], "image": c.get("Image", ""),
-                 "image_id": c.get("ImageID", ""), "labels": c.get("Labels") or {}}
+                 "image_id": c.get("ImageID", ""), "labels": c.get("Labels") or {},
+                 "infra": bool(c.get("IsInfra"))}
                 for c in json.loads(out or "[]")]
     ids = run_as(owner, ["docker", "ps", "-q", "--no-trunc"]).stdout.split()
     if not ids:
@@ -199,6 +282,7 @@ def attach_containers(services: list, listed: dict = None) -> None:
                 continue
         compose = [s for s in group if s.deployment == "compose"]
         quadlet = [s for s in group if s.deployment == "quadlet"]
+        by_name = {s.container: s for s in group if s.deployment == "container"}
         projects = systemd_projects(owner, containers) if runtime == "podman" and quadlet else {}
         home = pwd.getpwnam(owner).pw_dir if quadlet else ""
         whole_user = next((s for s in quadlet if same_path(s.path, home)), None)
@@ -207,8 +291,8 @@ def attach_containers(services: list, listed: dict = None) -> None:
         live_dirs = {os.path.realpath(wd) for c in containers
                      if (wd := c["labels"].get(WORKING_DIR_LABEL)) and os.path.isdir(wd)}
         for c in containers:
-            owner_svc = next((s for s in compose
-                              if s.matches(c["labels"], os.path.realpath(s.path) not in live_dirs)), None)
+            owner_svc = by_name.get(c["name"]) or next(
+                (s for s in compose if s.matches(c["labels"], os.path.realpath(s.path) not in live_dirs)), None)
             project = projects.get(c["id"], "")
             if owner_svc is None and project:
                 owner_svc = max((s for s in quadlet if is_under(project, s.path)),
@@ -389,13 +473,13 @@ def split_image_ref(ref: str) -> tuple:
     return ref, "latest"
 
 
-def sbom_project_name(c: dict) -> str:
+def sbom_project_name(c: dict, svc: Service) -> str:
     """The container's project name under its service in Dependency-Track: its
-    own name when a systemd unit or compose file keeps that name stable, else
-    its image's. Containers created on demand (e.g. one per user session) get
-    new names all the time and would leave a project behind each."""
+    own name when a systemd unit, compose file or registration keeps that name
+    stable, else its image's. Containers created on demand (e.g. one per user
+    session) get new names all the time and would leave a project behind each."""
     labels = c["labels"]
-    if labels.get(SYSTEMD_UNIT_LABEL) or labels.get("com.docker.compose.project"):
+    if svc.deployment == "container" or labels.get(SYSTEMD_UNIT_LABEL) or labels.get("com.docker.compose.project"):
         return c["name"]
     return "image-" + split_image_ref(c["image"])[0].rsplit("/", 1)[-1]
 
@@ -490,7 +574,7 @@ def cmd_sbom(args) -> int:
         uploaded = set()
         for c in svc.containers:
             image_key = c["image_id"] or c["image"]
-            child = sbom_project_name(c)
+            child = sbom_project_name(c, svc)
             if child in uploaded:
                 continue
             try:
@@ -570,16 +654,18 @@ def container_runtimes(busy: set) -> list:
     return sources
 
 
-def running_containers() -> dict:
+def running_containers(failed: set = None) -> dict:
     """(runtime, owner) -> running containers, for every runtime on the host. Warns
-    about each runtime that has containers running but cannot be listed; those
-    would be missing from discovery, and from the inventory."""
+    about each runtime that has containers running but cannot be listed (added to
+    failed); those would be missing from discovery, and from the inventory."""
     busy = conmon_uids()
     found = {}
     for runtime, owner in container_runtimes(busy):
         try:
             found[(runtime, owner)] = list_containers(runtime, owner)
         except (RuntimeError, subprocess.SubprocessError, OSError, ValueError) as e:
+            if failed is not None:
+                failed.add((runtime, owner))
             if runtime == "docker" or pwd.getpwnam(owner).pw_uid in busy:
                 detail = getattr(e, "stderr", "") or e
                 log(f"WARNING: {owner} has running {runtime} containers, but they cannot be listed: "
@@ -677,7 +763,7 @@ def uncovered_containers(services: list, listed: dict) -> list:
     groups = {}
     for (runtime, owner), containers in sorted(listed.items()):
         for c in containers:
-            if c["id"] not in claimed:
+            if c["id"] not in claimed and not c.get("infra"):
                 key = (owner, runtime, c["labels"].get("com.docker.compose.project", ""),
                        c["labels"].get(WORKING_DIR_LABEL, ""))
                 groups.setdefault(key, []).append(c["name"])
@@ -743,29 +829,98 @@ def ask_name(default: str, taken: set) -> str:
             return name
 
 
-def cmd_services(args) -> int:
-    services = load_registry()
-    registered_paths = {(s.deployment, os.path.realpath(s.path)) for s in services}
-    taken = {s.name for s in services}
-    auto = args.yes
+def clean_name(name: str, fallback: str) -> str:
+    return re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-.") or fallback
 
-    if services:
+
+def name_from_units(units: list, fallback: str) -> str:
+    """A service name for containers that systemd units start but whose project
+    directory cannot be told: the unit's name, or what several share
+    (sead-api, sead-db -> sead)."""
+    if len(units) == 1:
+        return clean_name(units[0], fallback)
+    common = []
+    for parts in zip(*(re.split(r"[-_.]", u) for u in units)):
+        if len(set(parts)) > 1:
+            break
+        common.append(parts[0])
+    name = "-".join(common)
+    return clean_name(name, fallback) if len(name) >= 3 else fallback
+
+
+def unique_name(name: str, taken: set) -> str:
+    n, candidate = 2, name
+    while candidate in taken:
+        candidate, n = f"{name}-{n}", n + 1
+    return candidate
+
+
+def days_since(day: str) -> int:
+    try:
+        return (date.today() - date.fromisoformat(day)).days
+    except ValueError:
+        return 0
+
+
+def cmd_services(args) -> int:
+    """Find services and register them. Interactive by default. With --auto (the
+    nightly humlab-discover.service) it registers what it finds without asking,
+    except what was declined or unregistered before, and unregisters services
+    that have had no running containers for SERVICE_EXPIRE_DAYS days."""
+    auto = args.auto
+    if auto and os.environ.get("SERVICE_DISCOVERY", "auto") != "auto":
+        print("SERVICE_DISCOVERY is not 'auto' in agents.env; nothing done")
+        return 0
+    services = load_registry()
+    ignored = load_ignored()
+    ignored_before = dict(ignored)
+    registered = {s.key for s in services}
+    taken = {s.name for s in services}
+    asked = set()
+    changes = []
+
+    if services and not auto:
         print("Already registered:")
         for s in services:
-            print(f"  {s.name:24} {s.deployment:8} {s.runtime:7} owner={s.owner:12} {s.path}")
+            print(f"  {s.name:24} {s.deployment:9} {s.runtime:7} owner={s.owner:12} {s.path or s.container}")
         print()
+
+    def offer(svc: Service, what: str, recommended: bool = True, note: str = "") -> None:
+        """Registers svc: in auto mode if recommended and not ignored, else if the
+        admin says yes. A no is remembered in ignored.conf."""
+        if svc.key in registered or svc.key in asked:
+            return
+        asked.add(svc.key)
+        if auto:
+            if not recommended or svc.key in ignored:
+                return
+            svc.name = unique_name(svc.name, taken)
+        else:
+            print(what)
+            if note:
+                print(f"  {note}")
+            declined = svc.key in ignored
+            if declined:
+                print(f"  Declined or unregistered before ({ignored[svc.key]}).")
+            if not ask_yes("  Monitor it?", recommended and not declined):
+                if not declined:
+                    ignore(ignored, svc, "declined")
+                return
+            svc.name = ask_name(unique_name(svc.name, taken), taken)
+            ignored.pop(svc.key, None)
+        svc.last_seen = date.today().isoformat()
+        services.append(svc)
+        registered.add(svc.key)
+        taken.add(svc.name)
+        changes.append(f"Registered {svc.name}: {what}")
 
     # Quadlet service users
     for pw in quadlet_users():
-        if ("quadlet", os.path.realpath(pw.pw_dir)) in registered_paths:
-            continue
-        print(f"Quadlet service user {pw.pw_name} ({pw.pw_dir})")
-        if auto or ask_yes("  Monitor it?", True):
-            name = pw.pw_name if auto else ask_name(pw.pw_name, taken)
-            services.append(Service(name, "quadlet", "podman", pw.pw_name, pw.pw_dir))
-            taken.add(name)
+        offer(Service(pw.pw_name, "quadlet", "podman", pw.pw_name, pw.pw_dir),
+              f"Quadlet service user {pw.pw_name} ({pw.pw_dir})")
 
-    listed = running_containers()
+    failed = set()
+    listed = running_containers(failed)
 
     # Containers that systemd units start in other accounts (quadlets outside
     # /srv, e.g. a deployment that installs its quadlets in a user's
@@ -775,81 +930,75 @@ def cmd_services(args) -> int:
             continue
         whole_user = same_path(project, pwd.getpwnam(owner).pw_dir)
         what = f"Podman containers of {owner}" if whole_user else f"Podman project {project} (user {owner})"
-        print(f"{what}, started by systemd: {', '.join(units)}")
-        if auto or ask_yes("  Monitor it?", True):
-            name = suggest_name(project, owner)
-            if auto:
-                name = name if name not in taken else f"{name}-{len(taken)}"
-            else:
-                name = ask_name(name, taken)
-            services.append(Service(name, "quadlet", "podman", owner, project))
-            taken.add(name)
+        # Without a project directory, the units say more than the home directory.
+        name = name_from_units(units, owner) if whole_user else suggest_name(project, owner)
+        offer(Service(name, "quadlet", "podman", owner, project), f"{what}, started by systemd: {', '.join(units)}")
 
-    # Compose projects
+    # Compose projects, found on disk
     roots = [r for r in DEFAULT_ROOTS if os.path.isdir(r)]
     if not auto:
         roots = ask("Directories to search for compose files", " ".join(roots)).split()
     running = running_compose_projects(listed)
     quadlet_homes = [os.path.realpath(s.path) for s in services if s.deployment == "quadlet"]
-    candidates = [d for d in find_compose_dirs(roots)
-                  if ("compose", os.path.realpath(d)) not in registered_paths
-                  and not any(os.path.realpath(d).startswith(h + "/") for h in quadlet_homes)]
 
-    def add_compose(path: str, info, interactive: bool) -> None:
-        if info:
-            runtime, owner, project = info.runtime, info.owner, info.name
-        else:
-            runtime, owner, project = "", pwd.getpwuid(os.stat(path).st_uid).pw_name, compose_project_name(path)
+    def compose_service(path: str, info) -> Service:
         # A project name set in the compose file says more than a directory name.
-        if project and project != compose_project_name(path):
-            default_name = project
+        if info.name != compose_project_name(path):
+            name = info.name
         else:
-            default_name = suggest_name(path, compose_project_name(path))
-        if not interactive:
-            name = default_name if default_name not in taken else f"{default_name}-{len(taken)}"
-        else:
-            name = ask_name(default_name, taken)
-            if not runtime:
-                runtime = ask("  Runtime (podman/docker)", "docker" if shutil.which("docker") else "podman")
-                if runtime == "docker":
-                    owner = "root"
-                owner = ask("  Owner (the user who runs it; root for docker or rootful podman)", owner)
-                while not user_exists(owner):
-                    owner = ask(f"  No user '{owner}'. Owner", "root")
-                project = ask("  Compose project name (the prefix of its container names)", project)
-        if runtime not in ("podman", "docker"):
-            print(f"  Skipped {path}: unknown runtime '{runtime}'")
-            return
-        services.append(Service(name, "compose", runtime, owner, os.path.realpath(path),
-                                project if project != compose_project_name(path) else ""))
-        taken.add(name)
+            name = suggest_name(path, compose_project_name(path))
+        return Service(name, "compose", info.runtime, info.owner, os.path.realpath(path),
+                       info.name if info.name != compose_project_name(path) else "")
 
     # Only running projects are offered; a home directory can hold dozens of
     # checkouts that are never started. Those can be added by path below.
+    registered_dirs = {os.path.realpath(s.path) for s in services if s.deployment == "compose"}
     idle = []
-    for d in candidates:
+    for d in find_compose_dirs(roots):
+        if os.path.realpath(d) in registered_dirs or any(os.path.realpath(d).startswith(h + "/") for h in quadlet_homes):
+            continue
         info, how = find_running_project(d, running, services)
         if not info:
             idle.append(d)
             continue
-        print(f"Compose project {d} (running under {info.runtime} as {info.owner}, matched by {how})")
-        if auto:
-            add_compose(d, info, False)
-        elif ask_yes("  Monitor it?", True):
-            add_compose(d, info, True)
+        offer(compose_service(d, info), f"Compose project {d} (running under {info.runtime} as {info.owner}, matched by {how})")
+
+    # Running compose projects whose directory the search did not find (outside
+    # the search roots, or an unusual compose file name).
+    for p in running:
+        if not (p.working_dir and os.path.isdir(p.working_dir)):
+            continue
+        if any(s.deployment == "compose" and (s.runtime, s.owner) == (p.runtime, p.owner) and s.matches(p.labels)
+               for s in services):
+            continue
+        offer(compose_service(p.working_dir, p),
+              f"Compose project {p.working_dir} (running under {p.runtime} as {p.owner})")
+
+    # Containers nothing else covers: started by hand, or from a compose
+    # directory that no longer exists. One service each.
+    attach_containers(services, listed)
+    claimed = {c["id"] for s in services for c in s.containers}
+    for (runtime, owner), containers in sorted(listed.items()):
+        for c in sorted(containers, key=lambda c: c["name"]):
+            labels = c["labels"]
+            wd = labels.get(WORKING_DIR_LABEL)
+            if c["id"] in claimed or c.get("infra") or labels.get(SYSTEMD_UNIT_LABEL) \
+                    or (labels.get("com.docker.compose.project") and wd and os.path.isdir(wd)):
+                continue
+            how = (f"compose project {labels['com.docker.compose.project']}, directory gone"
+                   if labels.get("com.docker.compose.project") else "started by hand")
+            generated = bool(GENERATED_NAME.match(c["name"]))
+            offer(Service(clean_name(c["name"], "container"), "container", runtime, owner, "", container=c["name"]),
+                  f"Container {c['name']} ({owner}, {runtime}, {how}, image {c['image']})",
+                  recommended=not generated,
+                  note="Its name was made up by the runtime and changes when the container is recreated."
+                  if generated else "")
+
     if idle and not auto:
-        print(f"\n{len(idle)} compose directories have no running containers and are not offered.")
+        print(f"\n{idle} compose directories have no running containers and are not offered.")
         if ask_yes("  List them?", False):
             for d in idle:
                 print(f"    {d}")
-
-    # Everything the inventory would leave out, so it can be added by hand.
-    uncovered = uncovered_containers(services, listed)
-    if uncovered:
-        print("\nRunning containers that no service covers (logged under their own names, no SBOM):")
-        for line in uncovered:
-            print(f"  {line}")
-        print()
 
     if not auto:
         while True:
@@ -862,23 +1011,66 @@ def cmd_services(args) -> int:
             info, how = find_running_project(path, running, services)
             if info:
                 print(f"  Running under {info.runtime} as {info.owner}, matched by {how}")
-            add_compose(path, info, True)
+                svc = compose_service(path, info)
+            else:
+                runtime = ask("  Runtime (podman/docker)", "docker" if shutil.which("docker") else "podman")
+                owner = "root" if runtime == "docker" else pwd.getpwuid(os.stat(path).st_uid).pw_name
+                owner = ask("  Owner (the user who runs it; root for docker or rootful podman)", owner)
+                while not user_exists(owner):
+                    owner = ask(f"  No user '{owner}'. Owner", "root")
+                project = ask("  Compose project name (the prefix of its container names)", compose_project_name(path))
+                svc = Service(suggest_name(path, project), "compose", runtime, owner, os.path.realpath(path),
+                              project if project != compose_project_name(path) else "")
+            if svc.runtime not in ("podman", "docker"):
+                print(f"  Skipped {path}: unknown runtime '{svc.runtime}'")
+                continue
+            asked.discard(svc.key)
+            ignored.pop(svc.key, None)
+            offer(svc, f"Compose project {path}")
 
         for s in list(services):
-            if not os.path.isdir(s.path) and ask_yes(f"{s.name}: {s.path} no longer exists. Remove it?", True):
+            if s.path and not os.path.isdir(s.path) and ask_yes(f"{s.name}: {s.path} no longer exists. Remove it?", True):
                 services.remove(s)
 
-    for owner in sorted({s.owner for s in services if s.runtime == "podman" and s.owner != "root"}):
-        if user_exists(owner):
-            uid = pwd.getpwnam(owner).pw_uid
-            if not os.path.exists(f"/var/lib/systemd/linger/{owner}"):
-                print(f"NOTE: {owner} has no lingering; its containers stop at logout and cannot be "
-                      f"scanned while it is logged out. Fix: loginctl enable-linger {owner}")
-            elif not os.path.isdir(f"/run/user/{uid}"):
-                print(f"NOTE: /run/user/{uid} for {owner} is missing")
+    # Last seen, and in auto mode unregistering what has been gone for a while.
+    # A runtime that could not be listed proves nothing about its services.
+    attach_containers(services, listed)
+    today = date.today().isoformat()
+    for s in services:
+        if s.containers or not s.last_seen:
+            s.last_seen = today
+    if auto:
+        expire = int(os.environ.get("SERVICE_EXPIRE_DAYS", "60"))
+        for s in list(services):
+            if (s.runtime, s.owner) not in failed and days_since(s.last_seen) >= expire:
+                services.remove(s)
+                changes.append(f"Unregistered {s.name}: no running containers since {s.last_seen}")
+
+    if not auto:
+        uncovered = uncovered_containers(services, listed)
+        if uncovered:
+            print("\nRunning containers that no service covers (logged under their own names, no SBOM):")
+            for line in uncovered:
+                print(f"  {line}")
+            print()
+        for owner in sorted({s.owner for s in services if s.runtime == "podman" and s.owner != "root"}):
+            if user_exists(owner):
+                uid = pwd.getpwnam(owner).pw_uid
+                if not os.path.exists(f"/var/lib/systemd/linger/{owner}"):
+                    print(f"NOTE: {owner} has no lingering; its containers stop at logout and cannot be "
+                          f"scanned while it is logged out. Fix: loginctl enable-linger {owner}")
+                elif not os.path.isdir(f"/run/user/{uid}"):
+                    print(f"NOTE: /run/user/{uid} for {owner} is missing")
 
     save_registry(services)
-    print(f"Saved {len(services)} services to {REGISTRY}")
+    if ignored != ignored_before:
+        save_ignored(ignored)
+    for line in changes:
+        print(line)
+    if auto and not changes:
+        print("No changes")
+    elif not auto:
+        print(f"Saved {len(services)} services to {REGISTRY}")
     return 0
 
 
@@ -888,15 +1080,20 @@ def cmd_remove(args) -> int:
     if unknown:
         log(f"ERROR: not registered: {', '.join(unknown)}")
         return 1
+    ignored = load_ignored()
+    for s in services:
+        if s.name in args.service:
+            ignore(ignored, s, "unregistered")
     save_registry([s for s in services if s.name not in args.service])
-    print(f"Removed {', '.join(args.service)}. Its containers are now logged under their own names; "
-          f"its Dependency-Track project is kept.")
+    save_ignored(ignored)
+    print(f"Removed {', '.join(args.service)}. Its containers are now logged under their own names, and "
+          f"automatic discovery leaves it alone; its Dependency-Track project is kept.")
     return 0
 
 
 def print_services(services: list) -> None:
     for i, s in enumerate(services, 1):
-        print(f"{i:3}. {s.name:24} {s.deployment:8} {s.runtime:7} owner={s.owner:12} {s.path}")
+        print(f"{i:3}. {s.name:24} {s.deployment:9} {s.runtime:7} owner={s.owner:12} {s.path or s.container}")
         for c in s.containers:
             print(f"       {c['name']:36} {c['image']}")
         if not s.containers:
@@ -928,10 +1125,10 @@ def cmd_edit(args) -> int:
             print(f"  Enter a number from 1 to {len(services)}.\n")
             continue
         s = services[int(choice) - 1]
-        print(f"\n{s.name}: {s.deployment} project in {s.path}")
+        print(f"\n{s.name}: " + (f"container {s.container}" if s.container else f"{s.deployment} project in {s.path}"))
         action = input("  [N] New name  [D] Unregister  [Enter] Back: ").strip().lower()
         if action == "n":
-            suggestion = suggest_name(s.path, s.name)
+            suggestion = clean_name(s.container, s.name) if s.container else suggest_name(s.path, s.name)
             name = ask_name(suggestion, {x.name for x in services} - {s.name})
             if name != s.name:
                 print(f"  Renamed {s.name} to {name}. New logs and metrics use the new name; stored logs keep\n"
@@ -944,7 +1141,11 @@ def cmd_edit(args) -> int:
             if ask_yes(f"  Unregister {s.name}?", False):
                 services.remove(s)
                 save_registry(services)
-                print(f"  Unregistered {s.name}. Its containers are now logged under their own names.")
+                ignored = load_ignored()
+                ignore(ignored, s, "unregistered")
+                save_ignored(ignored)
+                print(f"  Unregistered {s.name}. Its containers are now logged under their own names, and\n"
+                      f"  automatic discovery leaves it alone (find it again with F to undo that).")
         print()
 
 
@@ -969,7 +1170,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="humlab-agents", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("services", help="find and register services")
-    p.add_argument("--yes", action="store_true", help="register quadlet users, systemd-started projects and running compose projects without asking")
+    p.add_argument("--auto", "--yes", action="store_true",
+                   help="register what is found without asking (except what was declined or unregistered), "
+                        "and unregister services without running containers for SERVICE_EXPIRE_DAYS days")
     p.set_defaults(func=cmd_services)
     sub.add_parser("list", help="show registered services").set_defaults(func=cmd_list)
     sub.add_parser("edit", help="rename or unregister services, picked by number").set_defaults(func=cmd_edit)

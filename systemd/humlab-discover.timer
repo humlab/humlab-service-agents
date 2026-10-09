@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly service discovery, before the SBOM scan
+
+[Timer]
+OnCalendar=*-*-* 23:30
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

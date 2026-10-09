@@ -1,0 +1,13 @@
+[Unit]
+Description=Humlab agents: register new services, unregister long-gone ones
+Documentation=https://github.com/humlab/humlab-service-agents
+
+[Service]
+Type=oneshot
+# Root, like humlab-inventory: it lists every owner's containers. Leaves alone
+# what was declined or unregistered (/etc/humlab-agents/ignored.conf), and
+# unregisters services without running containers for SERVICE_EXPIRE_DAYS.
+EnvironmentFile=/etc/humlab-agents/agents.env
+ExecStart=/usr/local/bin/humlab-agents services --auto
+ExecStartPost=/usr/local/bin/humlab-agents inventory
+Nice=10
