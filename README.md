@@ -9,6 +9,15 @@ Client side of the blackbox monitoring stack. One install per server sends:
 | Host metrics and per-container CPU/memory | Prometheus remote write | Vector `host_metrics` |
 | SBOM per container image, daily | Dependency-Track | Syft |
 
+Some log lines are never sent: firewall drops (`[UFW BLOCK]`), container
+healthcheck requests (`GET /health`, `/healthz`, `/is_alive`, `/ping`, curl
+requests for `/`), the MongoDB connection and authentication lines each probe
+causes, MongoDB checkpoint notices, and nginx's error line for each 404 (the
+access log already has the request). Host logs are also rate-limited: at most
+10 lines of the same kind (same program, same text apart from numbers and ids)
+per 10 minutes. The rules are in `logs_shape` and `logs_repeats` in
+`vector/vector.yaml`.
+
 It works the same on servers that run services as rootless quadlets (one user
 per service under `/srv/<service>`), with podman-compose, or with docker-compose.
 
