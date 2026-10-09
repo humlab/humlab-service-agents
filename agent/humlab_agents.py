@@ -12,7 +12,6 @@ the user who owns it, and runs syft unprivileged. Standard library only.
 """
 
 import argparse
-import base64
 import configparser
 import glob
 import json
@@ -25,6 +24,7 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -349,17 +349,24 @@ class DependencyTrack:
     def upload(self, name: str, version: str, bom: dict, tags: list, parent: tuple = None) -> None:
         """Upload a BOM, creating the project (under parent) if needed.
 
-        Needs the API key permissions BOM_UPLOAD and PROJECT_CREATION_UPLOAD.
+        Multipart rather than Base64 in JSON, which Dependency-Track refuses above
+        20 MB (a large image's BOM). Needs the API key permissions BOM_UPLOAD and
+        PROJECT_CREATION_UPLOAD.
         """
-        payload = {"projectName": name, "projectVersion": version, "autoCreate": True,
-                   "projectTags": [{"name": t} for t in tags],
-                   "bom": base64.b64encode(json.dumps(bom).encode()).decode()}
+        fields = {"projectName": name, "projectVersion": version, "autoCreate": "true",
+                  "projectTags": ",".join(tags)}
         if parent:
-            payload["parentName"], payload["parentVersion"] = parent
-        req = urllib.request.Request(f"{self.url}/api/v1/bom", data=json.dumps(payload).encode(),
-                                     method="PUT", headers={"X-Api-Key": self.api_key,
-                                                            "Content-Type": "application/json",
-                                                            "Accept": "application/json"})
+            fields["parentName"], fields["parentVersion"] = parent
+        boundary = "humlab-" + uuid.uuid4().hex
+        parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+                 for k, v in fields.items()]
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="bom"; filename="bom.json"\r\n'
+                     f'Content-Type: application/json\r\n\r\n'.encode() + json.dumps(bom).encode() + b"\r\n")
+        body = b"".join(parts) + f"--{boundary}--\r\n".encode()
+        req = urllib.request.Request(f"{self.url}/api/v1/bom", data=body, method="POST",
+                                     headers={"X-Api-Key": self.api_key,
+                                              "Content-Type": f"multipart/form-data; boundary={boundary}",
+                                              "Accept": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=300) as r:
                 r.read()
